@@ -187,7 +187,7 @@ func New(ctx context.Context, config *configpb.SurfacerConf, l *logger.Logger) (
 func (s *Surfacer) writeMetrics(ctx context.Context, em *metrics.EventMetrics) error {
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return fmt.Errorf("error acquiring conn from the DB pool: %v", err) // handle error from acquiring connection from DB pool
+		return fmt.Errorf("error acquiring conn from the DB pool: %v", err)
 	}
 	defer conn.Close()
 
