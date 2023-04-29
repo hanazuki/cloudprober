@@ -2,8 +2,9 @@ package proto
 
 import (
 	"github.com/cloudprober/cloudprober/rds/file/proto"
-	proto_1 "github.com/cloudprober/cloudprober/rds/gcp/proto"
-	proto_5 "github.com/cloudprober/cloudprober/rds/kubernetes/proto"
+	proto_1 "github.com/cloudprober/cloudprober/rds/http/proto"
+	proto_5 "github.com/cloudprober/cloudprober/rds/gcp/proto"
+	proto_A "github.com/cloudprober/cloudprober/rds/kubernetes/proto"
 )
 
 #ServerConf: {
@@ -18,8 +19,10 @@ import (
 	{} | {
 		fileConfig: proto.#ProviderConfig @protobuf(4,file.ProviderConfig,name=file_config)
 	} | {
-		gcpConfig: proto_1.#ProviderConfig @protobuf(2,gcp.ProviderConfig,name=gcp_config)
+		httpConfig: proto_1.#ProviderConfig @protobuf(5,http.ProviderConfig,name=http_config)
 	} | {
-		kubernetesConfig: proto_5.#ProviderConfig @protobuf(3,kubernetes.ProviderConfig,name=kubernetes_config)
+		gcpConfig: proto_5.#ProviderConfig @protobuf(2,gcp.ProviderConfig,name=gcp_config)
+	} | {
+		kubernetesConfig: proto_A.#ProviderConfig @protobuf(3,kubernetes.ProviderConfig,name=kubernetes_config)
 	}
 }

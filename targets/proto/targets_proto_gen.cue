@@ -5,7 +5,8 @@ import (
 	proto_1 "github.com/cloudprober/cloudprober/rds/proto"
 	proto_5 "github.com/cloudprober/cloudprober/targets/gce/proto"
 	proto_A "github.com/cloudprober/cloudprober/targets/file/proto"
-	proto_8 "github.com/cloudprober/cloudprober/targets/lameduck/proto"
+	proto_8 "github.com/cloudprober/cloudprober/targets/http/proto"
+	proto_E "github.com/cloudprober/cloudprober/targets/lameduck/proto"
 )
 
 #RDSTargets: {
@@ -122,6 +123,13 @@ import (
 		// }
 		fileTargets: proto_A.#TargetsConf @protobuf(4,file.TargetsConf,name=file_targets)
 	} | {
+		// HTTP based targets.
+		// Example:
+		// http_targets {
+		//   url: "https://example.com/targets.textpb"
+		// }
+		httpTargets: proto_8.#TargetsConf @protobuf(7,http.TargetsConf,name=http_targets)
+	} | {
 		// K8s targets.
 		// Note: k8s targets are still in the experimental phase. Their config API
 		// may change in the future.
@@ -178,5 +186,5 @@ import (
 
 	// Lame duck options. If provided, targets module checks for the lame duck
 	// targets and removes them from the targets list.
-	lameDuckOptions?: proto_8.#Options @protobuf(2,lameduck.Options,name=lame_duck_options)
+	lameDuckOptions?: proto_E.#Options @protobuf(2,lameduck.Options,name=lame_duck_options)
 }

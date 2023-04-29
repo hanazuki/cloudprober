@@ -26,6 +26,7 @@ import (
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/rds/file"
 	"github.com/cloudprober/cloudprober/rds/gcp"
+	"github.com/cloudprober/cloudprober/rds/http"
 	"github.com/cloudprober/cloudprober/rds/kubernetes"
 	pb "github.com/cloudprober/cloudprober/rds/proto"
 	spb "github.com/cloudprober/cloudprober/rds/proto"
@@ -69,6 +70,14 @@ func (s *Server) initProviders(c *configpb.ServerConf) error {
 			}
 			s.l.Infof("rds.server: adding file provider with id: %s", id)
 			if p, err = file.New(pc.GetFileConfig(), s.l); err != nil {
+				return err
+			}
+		case *configpb.Provider_HttpConfig:
+			if id == "" {
+				id = http.DefaultProviderID
+			}
+			s.l.Infof("rds.server: adding http provider with id: %s", id)
+			if p, err = http.New(pc.GetHttpConfig(), s.l); err != nil {
 				return err
 			}
 		case *configpb.Provider_GcpConfig:

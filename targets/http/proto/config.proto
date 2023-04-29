@@ -1,0 +1,24 @@
+// Configuration proto for HTTP targets.
+syntax = "proto2";
+
+package cloudprober.targets.http;
+
+import "github.com/cloudprober/cloudprober/common/tlsconfig/proto/config.proto";
+import "github.com/cloudprober/cloudprober/rds/http/proto/config.proto";
+import "github.com/cloudprober/cloudprober/rds/proto/rds.proto";
+
+option go_package = "github.com/cloudprober/cloudprober/targets/http/proto";
+
+message TargetsConf {
+  optional string url = 1;
+
+  repeated .cloudprober.rds.Filter filter = 2;
+
+  required .cloudprober.rds.http.ProviderConfig.Format format = 3;
+
+  optional .cloudprober.tlsconfig.TLSConfig tls_config = 4;
+
+  optional int32 re_eval_sec = 5;
+
+  optional int32 timeout_sec = 6;
+}
