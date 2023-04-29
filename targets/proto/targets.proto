@@ -6,6 +6,7 @@ package cloudprober.targets;
 import "github.com/cloudprober/cloudprober/rds/client/proto/config.proto";
 import "github.com/cloudprober/cloudprober/rds/proto/rds.proto";
 import "github.com/cloudprober/cloudprober/targets/file/proto/config.proto";
+import "github.com/cloudprober/cloudprober/targets/http/proto/config.proto";
 import "github.com/cloudprober/cloudprober/targets/gce/proto/config.proto";
 import "github.com/cloudprober/cloudprober/targets/lameduck/proto/config.proto";
 
@@ -123,6 +124,13 @@ message TargetsDef {
     //   file_path: "/var/run/cloudprober/vips.textpb"
     // }
     file.TargetsConf file_targets = 4;
+
+    // HTTP based targets.
+    // Example:
+    // http_targets {
+    //   url: "https://example.com/targets.textpb"
+    // }
+    http.TargetsConf http_targets = 7;
 
     // K8s targets.
     // Note: k8s targets are still in the experimental phase. Their config API

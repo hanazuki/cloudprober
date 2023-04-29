@@ -39,6 +39,7 @@ import (
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 	"github.com/cloudprober/cloudprober/targets/file"
 	"github.com/cloudprober/cloudprober/targets/gce"
+	"github.com/cloudprober/cloudprober/targets/http"
 	targetspb "github.com/cloudprober/cloudprober/targets/proto"
 	dnsRes "github.com/cloudprober/cloudprober/targets/resolver"
 	"github.com/golang/protobuf/proto"
@@ -54,10 +55,11 @@ var (
 // Targets must have refreshed this much time after the lameduck for them to
 // become valid again. This is to take care of the following race between
 // targets refresh and lameduck creation:
-//   Targets are refreshed few seconds after lameduck, and are deleted few more
-//   seconds after that. If there is no min lameduck duration, we'll end up
-//   ignoring lameduck in this case. With min lameduck duration, targets will
-//   need to be refreshed few minutes after being lameducked.
+//
+//	Targets are refreshed few seconds after lameduck, and are deleted few more
+//	seconds after that. If there is no min lameduck duration, we'll end up
+//	ignoring lameduck in this case. With min lameduck duration, targets will
+//	need to be refreshed few minutes after being lameducked.
 const minLameduckDuration = 5 * time.Minute
 
 // extensionMap is a map of targets-types extensions. While creating new
@@ -359,6 +361,13 @@ func New(targetsDef *targetspb.TargetsDef, ldLister endpoint.Lister, globalOpts 
 			return nil, fmt.Errorf("target.New(): %v", err)
 		}
 		t.lister, t.resolver = ft, ft
+
+	case *targetspb.TargetsDef_HttpTargets:
+		ht, err := http.New(targetsDef.GetHttpTargets(), globalResolver, l)
+		if err != nil {
+			return nil, fmt.Errorf("target.New(): %v", err)
+		}
+		t.lister, t.resolver = ht, ht
 
 	case *targetspb.TargetsDef_K8S:
 		kt, err := k8sTargets(targetsDef.GetK8S(), l)
