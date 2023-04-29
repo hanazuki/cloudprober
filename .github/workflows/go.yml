@@ -156,6 +156,10 @@ jobs:
     needs: [build-and-test, build-binaries]
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Check out code into the Go module directory
         if: ${{ !contains(github.event_name, 'workflow_dispatch') }}
@@ -192,9 +196,6 @@ jobs:
           cp cloudprober-linux-amd64 cloudprober
           ls -R cloudprober*
           chmod a+rx cloudprober cloudprober-*
-          
-      - name: Build and push release Docker Image (main-ghcr)
-        run: make docker_multiarch DOCKER_IMAGE=ghcr.io/cloudprober/cloudprober
 
-      - name: Build and push release Docker Image (contrib-ghcr)
-        run: make docker_multiarch DOCKER_IMAGE=ghcr.io/cloudprober/cloudprober
+      - name: Build and push release Docker Image (main-ghcr)
+        run: make docker_multiarch DOCKER_IMAGE=ghcr.io/hanazuki/cloudprober
