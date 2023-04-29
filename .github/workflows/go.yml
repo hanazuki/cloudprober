@@ -192,15 +192,9 @@ jobs:
           cp cloudprober-linux-amd64 cloudprober
           ls -R cloudprober*
           chmod a+rx cloudprober cloudprober-*
-
-      - name: Build and push release Docker Image (main-dockerhub)
-        run: make docker_multiarch
-
+          
       - name: Build and push release Docker Image (main-ghcr)
         run: make docker_multiarch DOCKER_IMAGE=ghcr.io/cloudprober/cloudprober
-
-      - name: Build and push release Docker Image (contrib)
-        run: make -C contrib docker_multiarch
 
       - name: Build and push release Docker Image (contrib-ghcr)
         run: make docker_multiarch DOCKER_IMAGE=ghcr.io/cloudprober/cloudprober
