@@ -73,16 +73,15 @@ func TestStatsKeeper(t *testing.T) {
 	}
 	dataChan := make(chan *metrics.EventMetrics, len(targets))
 
-	opts := &options.Options{
-		StatsExportInterval: exportInterval,
-	}
+	opts := options.DefaultOptions()
+	opts.StatsExportInterval = exportInterval
 	go StatsKeeper(ctx, pType, pName, opts, targetsFunc, resultsChan, dataChan)
 
 	for _, target := range targets {
 		prr := newProbeRunResult(target.Name)
 		prr.sent.Inc()
 		prr.rcvd.Inc()
-		prr.rtt.IncBy(metrics.NewInt(20000))
+		prr.rtt.IncBy(20000)
 		resultsChan <- prr
 	}
 	time.Sleep(3 * time.Second)

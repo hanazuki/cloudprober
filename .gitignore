@@ -7,10 +7,21 @@
 # Unignore all dirs
 !*/
 
+# Unignore files without extensions
+!Dockerfile
+!AUTHORS
+!Makefile
+!LICENSE
+
 docs/node_modules
 docs/public
 docs/resources
 vendor/
-**DS_Store
 **.hugo_build.lock
 *.bak
+
+**DS_Store
+.vscode
+.scannerwork
+
+docs/_config_docs

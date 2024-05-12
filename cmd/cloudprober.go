@@ -23,6 +23,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"runtime/pprof"
@@ -32,18 +33,14 @@ import (
 
 	"flag"
 
-	"cloud.google.com/go/compute/metadata"
 	"github.com/cloudprober/cloudprober"
-	"github.com/cloudprober/cloudprober/common/file"
 	"github.com/cloudprober/cloudprober/config"
 	"github.com/cloudprober/cloudprober/config/runconfig"
-	"github.com/cloudprober/cloudprober/sysvars"
+	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/web"
-	"github.com/golang/glog"
 )
 
 var (
-	configFile       = flag.String("config_file", "", "Config file")
 	versionFlag      = flag.Bool("version", false, "Print version and exit")
 	buildInfoFlag    = flag.Bool("buildinfo", false, "Print build info and exit")
 	stopTime         = flag.Duration("stop_time", 0, "How long to wait for cleanup before process exits on SIGINT and SIGTERM")
@@ -51,10 +48,7 @@ var (
 	memprofile       = flag.String("memprof", "", "Write heap profile to file")
 	configTest       = flag.Bool("configtest", false, "Dry run to test config file")
 	dumpConfig       = flag.Bool("dumpconfig", false, "Dump processed config to stdout")
-	testInstanceName = flag.String("test_instance_name", "ig-us-central1-a-01-0000", "Instance name example to be used in tests")
-
-	// configTestVars provides a sane set of sysvars for config testing.
-	configTestVars = map[string]string(nil)
+	dumpConfigFormat = flag.String("dumpconfig_fmt", "textpb", "Dump config format (textpb, json, yaml)")
 )
 
 // These variables get overwritten by using -ldflags="-X main.<var>=<value?" at
@@ -62,24 +56,7 @@ var (
 var version string
 var buildTimestamp string
 var dirty string
-
-func setupConfigTestVars() {
-	configTestVars = map[string]string{
-		"zone":              "us-central1-a",
-		"project":           "fake-domain.com:fake-project",
-		"project_id":        "12345678",
-		"instance":          *testInstanceName,
-		"internal_ip":       "192.168.0.10",
-		"external_ip":       "10.10.10.10",
-		"instance_template": "ig-us-central1-a-01",
-		"machine_type":      "e2-small",
-	}
-}
-
-const (
-	configMetadataKeyName = "cloudprober_config"
-	defaultConfigFile     = "/etc/cloudprober.cfg"
-)
+var l *logger.Logger
 
 func setupProfiling() {
 	sigChan := make(chan os.Signal, 1)
@@ -89,10 +66,10 @@ func setupProfiling() {
 		var err error
 		f, err = os.Create(*cpuprofile)
 		if err != nil {
-			glog.Exit(err)
+			l.Critical(err.Error())
 		}
 		if err = pprof.StartCPUProfile(f); err != nil {
-			glog.Errorf("Could not start CPU profiling: %v", err)
+			l.Criticalf("Could not start CPU profiling: %v", err)
 		}
 	}
 	go func(file *os.File) {
@@ -100,56 +77,34 @@ func setupProfiling() {
 		pprof.StopCPUProfile()
 		if *cpuprofile != "" {
 			if err := file.Close(); err != nil {
-				glog.Exit(err)
+				l.Critical(err.Error())
 			}
 		}
 		if *memprofile != "" {
 			f, err := os.Create(*memprofile)
 			if err != nil {
-				glog.Exit(err)
+				l.Critical(err.Error())
 			}
 			if err = pprof.WriteHeapProfile(f); err != nil {
-				glog.Exit(err)
+				l.Critical(err.Error())
 			}
 			if err := f.Close(); err != nil {
-				glog.Exit(err)
+				l.Critical(err.Error())
 			}
 		}
 		os.Exit(1)
 	}(f)
 }
 
-func configFileToString(fileName string) string {
-	b, err := file.ReadFile(fileName)
-	if err != nil {
-		glog.Exitf("Failed to read the config file: %v", err)
-	}
-	return string(b)
-}
-
-func getConfig() string {
-	if *configFile != "" {
-		return configFileToString(*configFile)
-	}
-	// On GCE first check if there is a config in custom metadata
-	// attributes.
-	if metadata.OnGCE() {
-		if config, err := config.ReadFromGCEMetadata(configMetadataKeyName); err != nil {
-			glog.Infof("Error reading config from metadata. Err: %v", err)
-		} else {
-			return config
-		}
-	}
-	// If config not found in metadata, check default config on disk
-	if _, err := os.Stat(defaultConfigFile); !os.IsNotExist(err) {
-		return configFileToString(defaultConfigFile)
-	}
-	glog.Warningf("Config file %s not found. Using default config.", defaultConfigFile)
-	return config.DefaultConfig()
-}
-
 func main() {
 	flag.Parse()
+
+	// Initialize logger after parsing flags.
+	l = logger.NewWithAttrs(slog.String("component", "global"))
+
+	if len(flag.Args()) > 0 {
+		l.Criticalf("Unexpected non-flag arguments: %v", flag.Args())
+	}
 
 	if dirty == "1" {
 		version = version + " (dirty)"
@@ -159,7 +114,7 @@ func main() {
 	if buildTimestamp != "" {
 		ts, err := strconv.ParseInt(buildTimestamp, 10, 64)
 		if err != nil {
-			glog.Exitf("Error parsing build timestamp (%s). Err: %v", buildTimestamp, err)
+			l.Criticalf("Error parsing build timestamp (%s). Err: %v", buildTimestamp, err)
 		}
 		runconfig.SetBuildTimestamp(time.Unix(ts, 0))
 	}
@@ -175,36 +130,31 @@ func main() {
 		return
 	}
 
-	setupConfigTestVars()
-
 	if *dumpConfig {
-		sysvars.Init(nil, configTestVars)
-		text, err := config.ParseTemplate(getConfig(), sysvars.Vars())
+		out, err := config.DumpConfig(*dumpConfigFormat, nil)
 		if err != nil {
-			glog.Exitf("Error parsing config file. Err: %v", err)
+			l.Criticalf("Error dumping config. Err: %v", err)
 		}
-		fmt.Println(text)
+		fmt.Println(string(out))
 		return
 	}
 
 	if *configTest {
-		sysvars.Init(nil, configTestVars)
-		_, err := config.ParseForTest(configFileToString(*configFile), sysvars.Vars())
-		if err != nil {
-			glog.Exitf("Error parsing config file. Err: %v", err)
+		if err := config.ConfigTest(nil); err != nil {
+			l.Criticalf("Config test failed. Err: %v", err)
 		}
 		return
 	}
 
 	setupProfiling()
 
-	if err := cloudprober.InitFromConfig(getConfig()); err != nil {
-		glog.Exitf("Error initializing cloudprober. Err: %v", err)
+	if err := cloudprober.Init(); err != nil {
+		l.Criticalf("Error initializing cloudprober. Err: %v", err)
 	}
 
 	// web.Init sets up web UI for cloudprober.
 	if err := web.Init(); err != nil {
-		glog.Exitf("Error initializing web interface. Err: %v", err)
+		l.Criticalf("Error initializing web interface. Err: %v", err)
 	}
 
 	startCtx := context.Background()
@@ -222,7 +172,7 @@ func main() {
 
 		go func() {
 			sig := <-sigs
-			glog.Warningf("Received signal \"%v\", canceling the start context and waiting for %v before closing", sig, *stopTime)
+			l.Warningf("Received signal \"%v\", canceling the start context and waiting for %v before closing", sig, *stopTime)
 			cancelF()
 			time.Sleep(*stopTime)
 			os.Exit(0)

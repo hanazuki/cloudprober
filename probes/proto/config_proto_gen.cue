@@ -3,8 +3,8 @@ package proto
 import (
 	"github.com/cloudprober/cloudprober/targets/proto"
 	proto_1 "github.com/cloudprober/cloudprober/metrics/proto"
-	proto_5 "github.com/cloudprober/cloudprober/validators/proto"
-	proto_A "github.com/cloudprober/cloudprober/probes/alerting/proto"
+	proto_5 "github.com/cloudprober/cloudprober/internal/validators/proto"
+	proto_A "github.com/cloudprober/cloudprober/internal/alerting/proto"
 	proto_8 "github.com/cloudprober/cloudprober/probes/ping/proto"
 	proto_E "github.com/cloudprober/cloudprober/probes/http/proto"
 	proto_B "github.com/cloudprober/cloudprober/probes/dns/proto"
@@ -17,6 +17,7 @@ import (
 
 // Next tag: 101
 #ProbeDef: {
+	// Probe name. It should be unique across all probes.
 	name?: string @protobuf(1,string)
 
 	#Type: {"PING", #enumValue: 0} |
@@ -54,10 +55,6 @@ import (
 	}
 	type?: #Type @protobuf(2,Type)
 
-	// Which machines this probe should run on. If defined, cloudprober will run
-	// this probe only if machine's hostname matches this value.
-	runOn?: string @protobuf(3,string,name=run_on)
-
 	// Interval between two probe runs in milliseconds.
 	// Only one of "interval" and "inteval_msec" should be defined.
 	// Default interval is 2s.
@@ -78,7 +75,8 @@ import (
 	// Default timeout is 1s.
 	timeout?: string @protobuf(17,string)
 
-	// Targets for the probe
+	// Targets for the probe. Targets are required for all probes except
+	// for external, user_defined, and extension probe types.
 	targets?: proto.#TargetsDef @protobuf(6,targets.TargetsDef)
 
 	// Latency distribution. If specified, latency is stored as a distribution.
@@ -104,8 +102,8 @@ import (
 	//   }
 	latencyMetricName?: string @protobuf(15,string,name=latency_metric_name,#"default="latency""#)
 
-	// Validators are in experimental phase right now and can change at any time.
-	// NOTE: Only PING, HTTP and DNS probes support validators.
+	// Validators for this probe. Validators are run on the data returned by the
+	// probe. See https://cloudprober.org/docs/how-to/validators/ for more info.
 	validator?: [...proto_5.#Validator] @protobuf(9,validators.Validator)
 	// Set the source IP to send packets from, either by providing an IP address
 	// directly, or a network interface.
@@ -115,9 +113,9 @@ import (
 		sourceInterface: string @protobuf(11,string,name=source_interface)
 	}
 
-	// IP version to use for networking probes. If specified, this is used at the
-	// time of resolving a target, picking the correct IP for the source IP if
-	// source_interface option is provided, and to craft the packet correctly
+	// IP version to use for networking probes. If specified, this is used while
+	// 1) resolving a target, 2) picking the correct IP for the source IP if
+	// source_interface option is provided, and 3) to craft the packet correctly
 	// for PING probes.
 	//
 	// If ip_version is not configured but source_ip is provided, we get
@@ -155,14 +153,10 @@ import (
 	//
 	// Example:
 	//   additional_label {
-	//     key: "src_zone"
-	//     value: "{{.zone}}"
-	//   }
-	//   additional_label {
 	//     key: "app"
 	//     value: "@target.label.app@"
 	//   }
-	// (See a more detailed example at: examples/additional_label/cloudprober.cfg)
+	// (More detailed example at: examples/additional_label/cloudprober.cfg)
 	additionalLabel?: [...#AdditionalLabel] @protobuf(14,AdditionalLabel,name=additional_label)
 
 	// (Experimental) If set, test is inversed, i.e. we count it as success if
@@ -172,7 +166,22 @@ import (
 	// This is currently implemented only by PING and TCP probes.
 	// Note: This field is currently experimental, and may change in future.
 	negativeTest?: bool @protobuf(18,bool,name=negative_test)
-	alert?: [...proto_A.#AlertConf] @protobuf(19,alerts.AlertConf)
+
+	// Alerts configuration. If specified, cloudprober will generate alerts on
+	// probe failures. You can specify multiple alerts.
+	// Example:
+	//  alert {
+	//    name: "alert1"
+	//    condition {...}
+	//    notify {
+	//      pagerduty { ...}
+	//    }
+	//  }
+	//  alert {
+	//    name: "alert2"
+	//    notify { ... }
+	//  }
+	alert?: [...proto_A.#AlertConf] @protobuf(19,alerting.AlertConf)
 	{} | {
 		pingProbe: proto_8.#ProbeConf @protobuf(20,ping.ProbeConf,name=ping_probe)
 	} | {
@@ -190,10 +199,46 @@ import (
 	} | {
 		tcpProbe: proto_F.#ProbeConf @protobuf(27,tcp.ProbeConf,name=tcp_probe)
 	} | {
-		// This field's contents are passed on to the user defined probe, registered
-		// for this probe's name through probes.RegisterUserDefined().
+		// This field's contents are passed on to the user defined probe,
+		// registered for this probe's name through probes.RegisterUserDefined().
 		userDefinedProbe: string @protobuf(99,string,name=user_defined_probe)
 	}
+
+	// Which machines this probe should run on. If defined, cloudprober will run
+	// this probe only if machine's hostname matches this value. This is useful
+	// for large deployments, where you may want to use the same prober config
+	// everywhere but run this probe only on a subset of machines.
+	runOn?: string @protobuf(3,string,name=run_on)
+
+	// Schedule for the probe. You can use a schedule to specify when a probe
+	// should or should not run. This is useful for running probes only during
+	// business hours.
+	//
+	// You can specify multiple schedules. Probe will not run if any of the
+	// "DISABLE" schedules are active. If both "ENABLE" and "DISABLE" schedules
+	// overlap, "DISABLE" takes precedence.
+	//
+	// For example, to disable a probe during weekends and on Tuesday between 7pm
+	// and 8pm, e.g. for rollouts:
+	//   schdule {
+	//     type: DISABLE
+	//     start_weekday: FRIDAY
+	//     start_time: "20:00"
+	//     end_weekday: SUNDAY
+	//     end_time: "17:00"
+	//     timezone: "America/New_York"
+	//   }
+	//   schdule {
+	//     type: DISABLE
+	//     start_weekday: TUESDAY
+	//     start_time: "19:00"
+	//     end_weekday: TUESDAY
+	//     end_time: "20:00"
+	//     timezone: "America/New_York"
+	//   }
+	schedule?: [...#Schedule] @protobuf(101,Schedule)
+
+	// Debug options. Currently only used to enable logging metrics.
 	debugOptions?: #DebugOptions @protobuf(100,DebugOptions,name=debug_options)
 }
 
@@ -204,6 +249,55 @@ import (
 	// To get value from target's labels, use target.labels.<target's label key>
 	// as value.
 	value?: string @protobuf(2,string)
+}
+
+#Schedule: {
+	#Weekday: {"EVERYDAY", #enumValue: 0} |
+		{"SUNDAY", #enumValue: 1} |
+		{"MONDAY", #enumValue: 2} |
+		{"TUESDAY", #enumValue: 3} |
+		{"WEDNESDAY", #enumValue: 4} |
+		{"THURSDAY", #enumValue: 5} |
+		{"FRIDAY", #enumValue: 6} |
+		{"SATURDAY", #enumValue: 7}
+
+	#Weekday_value: {
+		EVERYDAY:  0
+		SUNDAY:    1
+		MONDAY:    2
+		TUESDAY:   3
+		WEDNESDAY: 4
+		THURSDAY:  5
+		FRIDAY:    6
+		SATURDAY:  7
+	}
+
+	#ScheduleType: {"ScheduleType_UNSPECIFIED", #enumValue: 0} |
+		{"ENABLE", #enumValue: 1} |
+		{"DISABLE", #enumValue: 2}
+
+	#ScheduleType_value: {
+		ScheduleType_UNSPECIFIED: 0
+		ENABLE:                   1
+		DISABLE:                  2
+	}
+	type?: #ScheduleType @protobuf(1,ScheduleType)
+
+	// Period start weekday. If not specified, it defaults to EVERYDAY.
+	startWeekday?: #Weekday @protobuf(2,Weekday,name=start_weekday,"default=EVERYDAY")
+
+	// Start time in 24 hour HH:MM format.
+	startTime?: string @protobuf(3,string,name=start_time,#"default="00:00""#)
+
+	// Period end weekday. If not specified, it defaults to EVERYDAY.
+	endWeekday?: #Weekday @protobuf(4,Weekday,name=end_weekday,"default=EVERYDAY")
+
+	// End time in 24 hour HH:MM format.
+	endTime?: string @protobuf(5,string,name=end_time,#"default="23:59""#)
+
+	// Timezone in which the probe should run. If not specified, it defaults to
+	// UTC. Example: "America/New_York"
+	timezone?: string @protobuf(6,string,#"default="UTC""#)
 }
 
 #DebugOptions: {

@@ -49,15 +49,15 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cloudprober/cloudprober/common/message"
+	"github.com/cloudprober/cloudprober/internal/udpmessage"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
 	"github.com/cloudprober/cloudprober/probes/common/statskeeper"
 	"github.com/cloudprober/cloudprober/probes/options"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 
+	udpsrv "github.com/cloudprober/cloudprober/internal/servers/udp"
 	configpb "github.com/cloudprober/cloudprober/probes/udplistener/proto"
-	udpsrv "github.com/cloudprober/cloudprober/servers/udp"
 )
 
 const (
@@ -77,7 +77,7 @@ type Probe struct {
 
 	// map target name to flow state.
 	targets []endpoint.Endpoint
-	fsm     *message.FlowStateMap
+	fsm     *udpmessage.FlowStateMap
 
 	// Process and output results synchronization.
 	mu   sync.Mutex
@@ -173,7 +173,7 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	p.c = c
 	p.echoMode = p.c.GetType() == configpb.ProbeConf_ECHO
 
-	p.fsm = message.NewFlowStateMap()
+	p.fsm = udpmessage.NewFlowStateMap()
 
 	udpAddr := &net.UDPAddr{Port: int(p.c.GetPort())}
 	if p.opts.SourceIP != nil {
@@ -223,7 +223,7 @@ func (p *Probe) processMessage(buf []byte, rxTS time.Time, srcAddr *net.UDPAddr)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	msg, err := message.NewMessage(buf)
+	msg, err := udpmessage.NewMessage(buf)
 	if err != nil {
 		p.errs.invalidMsgErrs[srcAddr.String()] = err.Error()
 		return
@@ -239,9 +239,9 @@ func (p *Probe) processMessage(buf []byte, rxTS time.Time, srcAddr *net.UDPAddr)
 	probeRes.total.Inc()
 	if msgRes.Success {
 		probeRes.success.Inc()
-		probeRes.ipdUS.IncBy(metrics.NewInt(msgRes.InterPktDelay.Nanoseconds() / 1000))
+		probeRes.ipdUS.IncBy(msgRes.InterPktDelay.Nanoseconds() / 1000)
 	} else if msgRes.LostCount > 0 {
-		probeRes.lost.IncBy(metrics.NewInt(int64(msgRes.LostCount)))
+		probeRes.lost.IncBy(int64(msgRes.LostCount))
 	} else if msgRes.Delayed {
 		probeRes.delayed.Inc()
 	}
@@ -254,7 +254,7 @@ func (p *Probe) outputResults(expectedCt int64, stats chan<- statskeeper.ProbeRe
 	for _, r := range p.res {
 		delta := expectedCt - r.total.Int64()
 		if delta > 0 {
-			r.total.AddInt64(delta)
+			r.total.IncBy(delta)
 		}
 		stats <- *r
 	}

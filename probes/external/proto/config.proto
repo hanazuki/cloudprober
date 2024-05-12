@@ -26,6 +26,10 @@ message ProbeConf {
   // will get converted to: /tools/recreate_vm -vm ig-us-central1-a
   required string command = 2;
 
+  // Command environment variables. These are passed on to the external probe
+  // process as environment variables.
+  map<string,string> env_var = 6;
+
   // Options for the SERVER mode probe requests. These options are passed on to
   // the external probe server as part of the ProbeRequest. Values are
   // substituted similar to command arguments for the ONCE mode probes.
@@ -42,4 +46,11 @@ message ProbeConf {
   // var1 value1 (for example: total_errors 589)
   optional bool output_as_metrics = 4 [default = true];
   optional metrics.payload.OutputMetricsOptions output_metrics_options = 5;
+
+  // (Only applicable to ONCE mode). Disable streaming output metrics. By
+  // default, external probe will export output metrics as they are available
+  // on the stdout. If this option is set to true, output metrics will be
+  // exported only after the probe has completed.
+  // New in version 0.13.4. This was true by default in previous versions. 
+  optional bool disable_streaming_output_metrics = 7 [default = false];
 }

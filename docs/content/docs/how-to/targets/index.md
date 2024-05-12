@@ -3,7 +3,7 @@ menu:
   docs:
     parent: how-to
     name: "Targets"
-    weight: 12
+    weight: 11
 title: "Targets"
 date: 2016-10-25T17:24:32-07:00
 ---
@@ -11,28 +11,28 @@ date: 2016-10-25T17:24:32-07:00
 Cloudprober probes usually run against some targets[^1] to check those targets'
 status, such as an HTTP probe to your APIs servers, or PING/TCP probes to a
 third-party provider to verify network connectivity to them. Each probe can have
-multiple targets. If a probe has multiple targets, Cloudprober runs concurrent
-probes against each target. This page further explains how targets work in
+multiple targets. If a probe has multiple targets, Cloudprober runs parallel
+probes for each target. This page further explains how targets work in
 Cloudprober.
+
+[^1]:
+    There are some cases where there is no explicit target, for example, you may
+    run a probe to measure your CI system's performance, or run a complex probe
+    that touches many endpoints.
 
 {{< figure src=targets.svg width=350 >}}
 
 ## Dynamically Discovered Targets
 
 One of the core features of Cloudprober is the automatic and continuous
-discovery of targets. This feature is especially critical for the dynamic
-environments that today's cloud based deployments make possible. For exmaple in
+discovery of targets. This feature is especially important for the dynamic
+environments that today's cloud based deployments make possible. For example in
 a kubernetes cluster the number of pods and their IPs can change on the fly,
 either in response to replica count changes or node failures. Automated targets
 discovery makes sure that we don't have to reconfigure Cloudprober in response
 to such events.
 
 {{< figure src=targets2.svg width=350 >}}
-
-[^1]:
-    There are some cases where there is no explicit target, for example, you may
-    run a probe to measure your CI system's performance, or run a complex probe
-    that touches many endpoints.
 
 ## Targets Configuration
 
@@ -52,9 +52,36 @@ probe {
 }
 ```
 
-In the above config, probe will run concurrently against 3 hosts:
+In the above config, probe will run against 3 hosts in parallel:
 _www.google.com_, _www.yahoo.com_, and _cloudprober:9313_ (yes, you can specify
 ports here for port-aware probes).
+
+You can specify more detailed targets using the
+[`endpoint`](/docs/config/targets/#cloudprober_targets_TargetsDef) field. Using
+endpoints, you can even specify the URL directly in target definition; this
+method is particularly useful if you want to run an HTTP probe for multiple
+similar targets.
+
+```shell
+probe {
+  type: HTTP
+  ...
+  targets {
+    endpoint {
+      # This will probe https://web.example.com/url1, target will show up as
+      # "frontend_main" in metrics.
+      name: "frontend_main"
+      url: "https://web.example.com/url1"
+    }
+    endpoint {
+      # This will probe http://cms.example.com, target will show up as
+      # "cms.example.com" in metrics.
+      name: "cms.example.com"
+    }
+  }
+  ..
+}
+```
 
 ### File based targets
 
@@ -114,7 +141,7 @@ don't want to rely on DNS for resolving its IP address.
 ### K8s targets
 
 K8s targets are explained at [Kubernetes
-Targets]({{< ref run-on-kubernetes.md >}}#kubernetes-targets).
+Targets]({{< ref k8s_targets.md >}}#kubernetes-targets).
 
 ### GCP targets
 
@@ -129,11 +156,12 @@ TODO: Add more details on GCP targets.
 
 ## Probe configuration through target fields
 
-| Field                | Probe Type                                   | Configuration                                                                                                                                                                |
-| -------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `port`               | Port aware probes (HTTP, DNS, TCP, UDP, etc) | If a target has an associated port, for example, a Kubernetes endpoint, it will automatically be used for probing unless a port has been explicitly configured in the probe. |
-| `label:relative_url` | HTTP                                         | If an explicit relative URL is not set, HTTP probe will use `relative_url` label's value if set.                                                                             |
-| `label:fqdn`         | HTTP                                         | HTTP probe will use target's `fqdn` label as the URL-host (host part of the URL) and Host header if available and if Host header has not been configured explicitly.         |
+| Field Or Label                  | Probe Type                                   | Configuration                                                                                                                                                                |
+| ------------------------------- | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `port`                          | Port aware probes (HTTP, DNS, TCP, UDP, etc) | If a target has an associated port, for example, a Kubernetes endpoint, it will automatically be used for probing unless a port has been explicitly configured in the probe. |
+| `__cp_path__` or `relative_url` | HTTP                                         | If an explicit relative URL is not set in the config, HTTP probe will use target's `__cp_path__` and `realtive_url` labels if set.                                           |
+| `__cp_host__` or `fqdn`         | HTTP                                         | HTTP probe will use target's `__cp_host__` and `fqdn` labels as URL-host and Host header if set and if Host header has not been configured explicitly.                       |
+| `__cp_scheme__`                 | HTTP                                         | HTTP probe will use target's `__cp_scheme__` label as HTTP URL scheme (http or https) header if available and if scheme has not been configured explicitly.                  |
 
 ## Metrics
 

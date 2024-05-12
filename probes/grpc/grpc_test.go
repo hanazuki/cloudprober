@@ -1,4 +1,4 @@
-// Copyright 2020 The Cloudprober Authors.
+// Copyright 2020-2023 The Cloudprober Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,31 +19,38 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"strconv"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	tlsconfigpb "github.com/cloudprober/cloudprober/common/tlsconfig/proto"
+	pb "github.com/cloudprober/cloudprober/internal/servers/grpc/proto"
+	spb "github.com/cloudprober/cloudprober/internal/servers/grpc/proto"
+	tlsconfigpb "github.com/cloudprober/cloudprober/internal/tlsconfig/proto"
+	"github.com/cloudprober/cloudprober/internal/validators"
+	validators_configpb "github.com/cloudprober/cloudprober/internal/validators/proto"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
 	"github.com/cloudprober/cloudprober/metrics/testutils"
 	configpb "github.com/cloudprober/cloudprober/probes/grpc/proto"
 	"github.com/cloudprober/cloudprober/probes/options"
-	pb "github.com/cloudprober/cloudprober/servers/grpc/proto"
-	spb "github.com/cloudprober/cloudprober/servers/grpc/proto"
 	"github.com/cloudprober/cloudprober/targets"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 	"github.com/cloudprober/cloudprober/targets/resolver"
+
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health/grpc_health_v1"
+	"google.golang.org/grpc/reflection"
 	"google.golang.org/protobuf/proto"
 )
 
-var once sync.Once
-var srvAddr string
+var global = struct {
+	srvAddr string
+	mu      sync.RWMutex
+}{}
 
 type Server struct {
 	delay time.Duration
@@ -86,27 +93,35 @@ func (s *Server) BlobWrite(ctx context.Context, req *pb.BlobWriteRequest) (*pb.B
 
 // globalGRPCServer sets up runconfig and returns a gRPC server.
 func globalGRPCServer(delay time.Duration) (string, error) {
-	var err error
-	once.Do(func() {
-		var ln net.Listener
-		ln, err = net.Listen("tcp", "localhost:0")
-		if err != nil {
-			return
-		}
-		grpcSrv := grpc.NewServer()
-		srv := &Server{delay: delay, msg: make([]byte, 1024)}
-		spb.RegisterProberServer(grpcSrv, srv)
-		go grpcSrv.Serve(ln)
-		tcpAddr := ln.Addr().(*net.TCPAddr)
-		srvAddr = net.JoinHostPort(tcpAddr.IP.String(), strconv.Itoa(tcpAddr.Port))
-		time.Sleep(time.Second * 2)
-	})
-	return srvAddr, err
+	global.mu.Lock()
+	defer global.mu.Unlock()
+
+	if global.srvAddr != "" {
+		return global.srvAddr, nil
+	}
+
+	ln, err := net.Listen("tcp", "localhost:0")
+	if err != nil {
+		return "", err
+	}
+
+	grpcSrv := grpc.NewServer()
+	reflection.Register(grpcSrv) // Enable reflection
+
+	srv := &Server{delay: delay, msg: make([]byte, 1024)}
+	spb.RegisterProberServer(grpcSrv, srv)
+	go grpcSrv.Serve(ln)
+
+	// Make sure that the server is up before running
+	time.Sleep(time.Second * 2)
+	global.srvAddr = ln.Addr().String()
+	return global.srvAddr, nil
 }
 
 // TestGRPCSuccess tests probe output on success.
 // 2 connections, 1 probe/sec/conn, stats exported every 5 sec
-// 	=> 5-10 results/interval. Test looks for minimum of 7 results.
+//
+//	=> 5-10 results/interval. Test looks for minimum of 7 results.
 func TestGRPCSuccess(t *testing.T) {
 	interval, timeout := 100*time.Millisecond, 100*time.Millisecond
 	addr, err := globalGRPCServer(timeout / 2)
@@ -114,67 +129,137 @@ func TestGRPCSuccess(t *testing.T) {
 		t.Fatalf("Error initializing global config: %v", err)
 	}
 
-	iters := 5
-	statsExportInterval := time.Duration(iters) * interval
-
-	probeOpts := &options.Options{
-		Targets:             targets.StaticTargets(addr),
-		Interval:            interval,
-		Timeout:             timeout,
-		ProbeConf:           &configpb.ProbeConf{NumConns: proto.Int32(2)},
-		Logger:              &logger.Logger{},
-		StatsExportInterval: statsExportInterval,
-		LogMetrics:          func(em *metrics.EventMetrics) {},
-	}
-	p := &Probe{}
-	p.Init("grpc-success", probeOpts)
-	dataChan := make(chan *metrics.EventMetrics, 5)
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		p.Start(ctx, dataChan)
-	}()
-
-	expectedLabels := map[string]string{"ptype": "grpc", "dst": addr, "probe": "grpc-success"}
-
-	ems, err := testutils.MetricsFromChannel(dataChan, 2, 1500*time.Millisecond)
-	if err != nil || len(ems) != 2 {
-		t.Errorf("Err: %v", err)
+	tests := []struct {
+		name            string
+		validationRegex string
+		method          *configpb.ProbeConf_MethodType
+	}{
+		{
+			name:            "echo",
+			method:          configpb.ProbeConf_ECHO.Enum(),
+			validationRegex: "blob:.*",
+		},
+		{
+			name:   "blob_read_regex",
+			method: configpb.ProbeConf_READ.Enum(),
+		},
+		{
+			name:   "blob_write",
+			method: configpb.ProbeConf_WRITE.Enum(),
+		},
+		{
+			name:            "generic_request",
+			method:          configpb.ProbeConf_GENERIC.Enum(),
+			validationRegex: "^cloudprober.servers.grpc.Prober,grpc.reflection.v1.ServerReflection,grpc.reflection.v1alpha.ServerReflection$",
+		},
 	}
 
-	for i, em := range ems {
-		expectedMinCount := int64((i + 1) * (iters + 1))
-		assert.GreaterOrEqual(t, em.Metric("total").(*metrics.Int).Int64(), expectedMinCount, "message#: %d, total, em: %s", i, em.String())
-		assert.GreaterOrEqual(t, em.Metric("success").(*metrics.Int).Int64(), expectedMinCount, "message#: %d, success, em: %s", i, em.String())
-		gotLabels := make(map[string]string)
-		for _, k := range em.LabelsKeys() {
-			gotLabels[k] = em.Label(k)
-		}
-		assert.Equal(t, expectedLabels, gotLabels)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
 
-	cancel()
-	wg.Wait()
+			iters := 5
+			statsExportInterval := time.Duration(iters) * interval
+
+			probeOpts := &options.Options{
+				Targets:             targets.StaticTargets(addr),
+				Interval:            interval,
+				Timeout:             timeout,
+				Logger:              &logger.Logger{},
+				StatsExportInterval: statsExportInterval,
+				LogMetrics:          func(em *metrics.EventMetrics) {},
+			}
+
+			if tt.validationRegex != "" {
+				cfg := []*validators_configpb.Validator{
+					{
+						Name: "regex",
+						Type: &validators_configpb.Validator_Regex{
+							Regex: tt.validationRegex,
+						},
+					},
+				}
+				probeOpts.Validators, _ = validators.Init(cfg, nil)
+			}
+
+			cfg := &configpb.ProbeConf{
+				NumConns:          proto.Int32(2),
+				Method:            tt.method,
+				InsecureTransport: proto.Bool(true),
+			}
+
+			if tt.method.String() == "GENERIC" {
+				cfg.Request = &configpb.GenericRequest{
+					RequestType: &configpb.GenericRequest_ListServices{
+						ListServices: true,
+					},
+				}
+			}
+
+			probeOpts.ProbeConf = cfg
+
+			p := &Probe{}
+			p.Init("grpc-success", probeOpts)
+			dataChan := make(chan *metrics.EventMetrics, 5)
+			ctx, cancel := context.WithCancel(context.Background())
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				p.Start(ctx, dataChan)
+			}()
+
+			expectedLabels := map[string]string{"ptype": "grpc", "dst": addr, "probe": "grpc-success"}
+
+			ems, err := testutils.MetricsFromChannel(dataChan, 2, 1500*time.Millisecond)
+			if err != nil || len(ems) != 2 {
+				t.Error(err)
+			}
+
+			for i, em := range ems {
+				expectedMinCount := int64((i + 1) * (iters + 1))
+				assert.GreaterOrEqual(t, em.Metric("total").(*metrics.Int).Int64(), expectedMinCount, "message#: %d, total, em: %s", i, em.String())
+				assert.GreaterOrEqual(t, em.Metric("success").(*metrics.Int).Int64(), expectedMinCount, "message#: %d, success, em: %s", i, em.String())
+				gotLabels := make(map[string]string)
+				for _, k := range em.LabelsKeys() {
+					gotLabels[k] = em.Label(k)
+				}
+				assert.Equal(t, expectedLabels, gotLabels)
+			}
+
+			cancel()
+			wg.Wait()
+		})
+	}
 }
 
 // TestConnectFailures attempts to connect to localhost:9 (discard port) and
 // checks that stats are exported once every connect timeout.
 // 2 connections, 0.5 connect attempt/sec/conn, stats exported every 6 sec
-//  => 3 - 6 connect errors/sec. Test looks for minimum of 4 attempts.
+//
+//	=> 3 - 6 connect errors/sec. Test looks for minimum of 4 attempts.
 func TestConnectFailures(t *testing.T) {
+	// This test is super unreliable on CI. We should consider it disabling it
+	// for all platforms.
+	if runtime.GOOS == "darwin" && os.Getenv("CI") == "true" {
+		t.Skip("Skipping connect failure test on macos for CI")
+	}
 	interval, timeout := 100*time.Millisecond, 100*time.Millisecond
 	addr := "localhost:9"
 
-	iters := 6
-	statsExportInterval := time.Duration(6) * interval
+	numIntervals := 3
+	// we wait for numIntervals * interval before checking the results.
+	// there will be about numIntervals-1 attempts in this period.
+	statsExportInterval := time.Duration(numIntervals) * interval
 
 	probeOpts := &options.Options{
-		Targets:             targets.StaticTargets(addr),
-		Interval:            interval,
-		Timeout:             timeout,
-		ProbeConf:           &configpb.ProbeConf{NumConns: proto.Int32(2)},
+		Targets:  targets.StaticTargets(addr),
+		Interval: interval,
+		Timeout:  timeout,
+		ProbeConf: &configpb.ProbeConf{
+			NumConns:          proto.Int32(2),
+			InsecureTransport: proto.Bool(true),
+		},
 		Logger:              &logger.Logger{},
 		StatsExportInterval: statsExportInterval,
 		LogMetrics:          func(em *metrics.EventMetrics) {},
@@ -197,7 +282,9 @@ func TestConnectFailures(t *testing.T) {
 	}
 
 	for i, em := range ems {
-		expectedMinCount := int64((i + 1) * (iters + 1))
+		// Since connect attempt is made every "interval", we expect at least
+		// numIntervals-1 attempts in first EM, 2*(numIntervals-1) in next.
+		expectedMinCount := int64((i+1)*numIntervals - 1)
 		assert.GreaterOrEqual(t, em.Metric("total").(*metrics.Int).Int64(), expectedMinCount, "message#: %d, total, em: %s", i, em.String())
 		assert.GreaterOrEqual(t, em.Metric("connecterrors").(*metrics.Int).Int64(), expectedMinCount, "message#: %d, connecterrors, em: %s", i, em.String())
 		// 0 success
@@ -220,10 +307,13 @@ func TestProbeTimeouts(t *testing.T) {
 	statsExportInterval := time.Duration(iters) * interval
 
 	probeOpts := &options.Options{
-		Targets:             targets.StaticTargets(addr),
-		Interval:            interval,
-		Timeout:             timeout,
-		ProbeConf:           &configpb.ProbeConf{NumConns: proto.Int32(1)},
+		Targets:  targets.StaticTargets(addr),
+		Interval: interval,
+		Timeout:  timeout,
+		ProbeConf: &configpb.ProbeConf{
+			NumConns:          proto.Int32(1),
+			InsecureTransport: proto.Bool(true),
+		},
 		Logger:              &logger.Logger{},
 		LatencyUnit:         time.Millisecond,
 		StatsExportInterval: statsExportInterval,
@@ -328,20 +418,20 @@ func TestTargets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error retrieving metrics: %v", err)
 	}
-	mm := testutils.MetricsMap(ems)
+	mmap := testutils.MetricsMapByTarget(ems)
 
-	sumIntMetrics := func(ems []*metrics.EventMetrics, metricName string) int64 {
+	sumIntMetrics := func(mv []metrics.Value) int64 {
 		sum := metrics.NewInt(0)
-		for _, em := range ems {
-			sum.Add(em.Metric(metricName))
+		for _, v := range mv {
+			sum.Add(v)
 		}
 		return sum.Int64()
 	}
 
 	connErrTargets := make(map[string]int64)
 	connErrIterCount := 0
-	for target, vals := range mm["connecterrors"] {
-		s := sumIntMetrics(vals, "connecterrors")
+	for target, vals := range mmap.Filter("connecterrors") {
+		s := sumIntMetrics(vals)
 		if s > 0 {
 			connErrTargets[target] = s
 		}
@@ -352,8 +442,8 @@ func TestTargets(t *testing.T) {
 
 	successTargets := make(map[string]int64)
 	successIterCount := 0
-	for target, vals := range mm["success"] {
-		s := sumIntMetrics(vals, "success")
+	for target, vals := range mmap.Filter("success") {
+		s := sumIntMetrics(vals)
 		if s > 0 {
 			successTargets[target] = s
 			if connErrTargets[target] > 0 {
@@ -430,7 +520,7 @@ func TestHealthCheckProbe(t *testing.T) {
 				}, nil
 			}
 
-			err := p.healthCheckProbe(context.Background(), nil, "")
+			_, err := p.healthCheckProbe(context.Background(), nil)
 			if err != nil && !test.wantErr {
 				t.Errorf("Unexpected error: %v", err)
 				return

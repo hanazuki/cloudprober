@@ -4,6 +4,7 @@ on:
   push:
     paths:
       - 'docs/**'
+      - '**proto/*.proto'
       - '.github/workflows/hugo.yml'
 
 jobs:
@@ -19,6 +20,13 @@ jobs:
           cache: 'npm'
           cache-dependency-path: 'docs/package-lock.json'
 
+      - name: Set up Go
+        uses: actions/setup-go@v3
+        with:
+          go-version-file: go.mod
+          cache: true
+        id: go
+
       - name: Setup public worktree
         run: cd docs && git worktree add public gh-pages
 
@@ -33,6 +41,7 @@ jobs:
 
       - name: Build pages
         run: |
+          make config_docs
           cd docs
           npm install
           npm run build

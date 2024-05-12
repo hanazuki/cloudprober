@@ -2,14 +2,16 @@ syntax = "proto2";
 
 package cloudprober.surfacer;
 
-import "github.com/cloudprober/cloudprober/surfacers/cloudwatch/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/datadog/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/file/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/postgres/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/probestatus/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/prometheus/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/pubsub/proto/config.proto";
-import "github.com/cloudprober/cloudprober/surfacers/stackdriver/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/cloudwatch/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/datadog/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/file/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/otel/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/postgres/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/probestatus/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/prometheus/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/pubsub/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/stackdriver/proto/config.proto";
+import "github.com/cloudprober/cloudprober/surfacers/internal/bigquery/proto/config.proto";
 
 option go_package = "github.com/cloudprober/cloudprober/surfacers/proto";
 
@@ -23,7 +25,9 @@ enum Type {
   PUBSUB = 5;
   CLOUDWATCH = 6;  // Experimental mode.
   DATADOG = 7;     // Experimental mode.
-  PROBESTATUS = 8; // Experimental mode.
+  PROBESTATUS = 8;
+  BIGQUERY = 9;    // Experimental mode.
+  OTEL = 10;
   USER_DEFINED = 99;
 }
 
@@ -74,13 +78,13 @@ message SurfacerDef {
   //
   // For efficiency reasons, filtering by metric name has to be implemented by
   // individual surfacers (while going through metrics within an EventMetrics).
-  // Currently following surfacers implement it:
-  //     CLOUDWATCH, PROMETHEUS, STACKDRIVER
+  // As FILE and PUBSUB surfacers export eventmetrics as is, they don't support
+  // this option.
   optional string allow_metrics_with_name = 6;
   optional string ignore_metrics_with_name = 7;
 
-  // Whether to add failure metric or not. For stackdriver surfacer, we add
-  // failure metric by default.
+  // Whether to add failure metric or not. This option is enabled by default
+  // for all surfacers except FILE and PUBSUB.
   optional bool add_failure_metric = 8;
 
   // If set to true, cloudprober will export all metrics as gauge metrics. Note
@@ -91,6 +95,11 @@ message SurfacerDef {
   // However, it should not be noticeable unless you're producing large number
   // of metrics (say > 10000 metrics per second).
   optional bool export_as_gauge = 9;
+
+
+  // Latency metric name pattern, used to identify latency metrics, and add
+  // EventMetric's LatencyUnit to it.
+  optional string latency_metric_pattern = 51 [default = "^(.+_|)latency$"];
 
   // Matching surfacer specific configuration (one for each type in the above
   // enum)
@@ -103,5 +112,7 @@ message SurfacerDef {
     cloudwatch.SurfacerConf cloudwatch_surfacer = 15;
     datadog.SurfacerConf datadog_surfacer = 16;
     probestatus.SurfacerConf probestatus_surfacer = 17;
+    bigquery.SurfacerConf bigquery_surfacer = 18;
+    otel.SurfacerConf otel_surfacer = 19;
   }
 }

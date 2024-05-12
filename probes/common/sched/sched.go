@@ -108,6 +108,9 @@ func (s *Scheduler) startForTarget(ctx context.Context, target endpoint.Endpoint
 		if ctxDone(ctx) {
 			return
 		}
+		if !s.Opts.IsScheduled() {
+			continue
+		}
 		s.RunProbeForTarget(ctx, target, result)
 
 		// Export stats if it's the time to do so.
@@ -117,14 +120,7 @@ func (s *Scheduler) startForTarget(ctx context.Context, target endpoint.Endpoint
 				AddLabel("probe", s.ProbeName).
 				AddLabel("dst", target.Dst())
 
-			em.LatencyUnit = s.Opts.LatencyUnit
-
-			for _, al := range s.Opts.AdditionalLabels {
-				em.AddLabel(al.KeyValueForTarget(target))
-			}
-
-			s.Opts.LogMetrics(em)
-			s.DataChan <- em
+			s.Opts.RecordMetrics(target, em, s.DataChan)
 		}
 	}
 }
@@ -182,8 +178,16 @@ func (s *Scheduler) refreshTargets(ctx context.Context) {
 
 		go func(target endpoint.Endpoint, waitTime time.Duration) {
 			defer s.waitGroup.Done()
-			// Wait for wait time + some jitter before starting this probe loop.
-			time.Sleep(waitTime + time.Duration(rand.Int63n(gapBetweenTargets.Microseconds()/10))*time.Microsecond)
+			if waitTime > 0 {
+				// For random padding using 1/10th of the gap.
+				jitterMaxUsec := gapBetweenTargets.Microseconds() / 10
+				// Make sure we don't pass 0 to rand.Int63n.
+				if jitterMaxUsec <= 0 {
+					jitterMaxUsec = 1
+				}
+				// Wait for wait time + some jitter before starting this probe loop.
+				time.Sleep(waitTime + time.Duration(rand.Int63n(jitterMaxUsec))*time.Microsecond)
+			}
 			s.startForTarget(probeCtx, target)
 		}(target, startWaitTime)
 

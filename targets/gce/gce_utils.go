@@ -20,12 +20,12 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/golang/protobuf/proto"
-	rdspb "github.com/cloudprober/cloudprober/rds/proto"
+	rdspb "github.com/cloudprober/cloudprober/internal/rds/proto"
 	configpb "github.com/cloudprober/cloudprober/targets/gce/proto"
 	dnsRes "github.com/cloudprober/cloudprober/targets/resolver"
 	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
+	"google.golang.org/protobuf/proto"
 )
 
 // defaultComputeService returns the compute service to use for the GCE API

@@ -25,6 +25,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -33,20 +34,20 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/cloudprober/cloudprober/common/tlsconfig"
 	"github.com/cloudprober/cloudprober/config"
 	configpb "github.com/cloudprober/cloudprober/config/proto"
 	"github.com/cloudprober/cloudprober/config/runconfig"
+	"github.com/cloudprober/cloudprober/internal/servers"
+	"github.com/cloudprober/cloudprober/internal/sysvars"
+	"github.com/cloudprober/cloudprober/internal/tlsconfig"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/prober"
 	"github.com/cloudprober/cloudprober/probes"
-	"github.com/cloudprober/cloudprober/servers"
 	"github.com/cloudprober/cloudprober/surfacers"
-	"github.com/cloudprober/cloudprober/sysvars"
-	"github.com/golang/protobuf/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/channelz/service"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/reflection"
 )
 
 const (
@@ -67,10 +68,10 @@ var cloudProber struct {
 	prober          *prober.Prober
 	defaultServerLn net.Listener
 	defaultGRPCLn   net.Listener
-	textConfig      string
+	configSource    config.ConfigSource
 	config          *configpb.ProberConfig
 	cancelInitCtx   context.CancelFunc
-	sync.Mutex
+	sync.RWMutex
 }
 
 func getServerHost(c *configpb.ProberConfig) string {
@@ -140,6 +141,15 @@ func setDebugHandlers(srvMux *http.ServeMux) {
 
 // InitFromConfig initializes Cloudprober using the provided config.
 func InitFromConfig(configFile string) error {
+	return InitWithConfigSource(config.ConfigSourceWithFile(configFile))
+}
+
+// Init initializes Cloudprober using the default config source.
+func Init() error {
+	return InitWithConfigSource(config.DefaultConfigSource())
+}
+
+func InitWithConfigSource(configSrc config.ConfigSource) error {
 	// Return immediately if prober is already initialized.
 	cloudProber.Lock()
 	defer cloudProber.Unlock()
@@ -149,33 +159,20 @@ func InitFromConfig(configFile string) error {
 	}
 
 	// Initialize sysvars module
-	l, err := logger.NewCloudproberLog(sysvarsModuleName)
+	if err := sysvars.Init(logger.NewWithAttrs(slog.String("component", sysvarsModuleName)), nil); err != nil {
+		return err
+	}
+
+	cfg, err := configSrc.GetConfig()
 	if err != nil {
 		return err
 	}
 
-	if err := sysvars.Init(l, nil); err != nil {
-		return err
-	}
-
-	configStr, err := config.ParseTemplate(configFile, sysvars.Vars())
-	if err != nil {
-		return err
-	}
-
-	cfg := &configpb.ProberConfig{}
-	if err := proto.UnmarshalText(configStr, cfg); err != nil {
-		return err
-	}
-
-	globalLogger, err := logger.NewCloudproberLog("global")
-	if err != nil {
-		return fmt.Errorf("error in initializing global logger: %v", err)
-	}
+	globalLogger := logger.NewWithAttrs(slog.String("component", "global"))
 
 	// Start default HTTP server. It's used for profile handlers and
 	// prometheus exporter.
-	ln, err := initDefaultServer(cfg, l)
+	ln, err := initDefaultServer(cfg, globalLogger)
 	if err != nil {
 		return err
 	}
@@ -206,6 +203,7 @@ func InitFromConfig(configFile string) error {
 		}
 
 		s := grpc.NewServer(serverOpts...)
+		reflection.Register(s)
 		// register channelz service to the default grpc server port
 		service.RegisterChannelzServiceToServer(s)
 		runconfig.SetDefaultGRPCServer(s)
@@ -228,10 +226,11 @@ func InitFromConfig(configFile string) error {
 
 	cloudProber.prober = pr
 	cloudProber.config = cfg
-	cloudProber.textConfig = configStr
+	cloudProber.configSource = configSrc
 	cloudProber.defaultServerLn = ln
 	cloudProber.defaultGRPCLn = grpcLn
 	cloudProber.cancelInitCtx = cancelFunc
+
 	return nil
 }
 
@@ -241,7 +240,8 @@ func Start(ctx context.Context) {
 	defer cloudProber.Unlock()
 
 	// Default servers
-	httpSrv := &http.Server{Handler: runconfig.DefaultHTTPServeMux()}
+	srvMux := runconfig.DefaultHTTPServeMux()
+	httpSrv := &http.Server{Handler: srvMux}
 	grpcSrv := runconfig.DefaultGRPCServer()
 
 	// Set up a goroutine to cleanup if context ends.
@@ -256,8 +256,8 @@ func Start(ctx context.Context) {
 		defer cloudProber.Unlock()
 		cloudProber.defaultServerLn = nil
 		cloudProber.defaultGRPCLn = nil
-		cloudProber.textConfig = ""
 		cloudProber.config = nil
+		cloudProber.configSource = nil
 		cloudProber.prober = nil
 	}()
 
@@ -271,25 +271,41 @@ func Start(ctx context.Context) {
 	}
 
 	cloudProber.prober.Start(ctx)
+	srvMux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "OK")
+	})
 }
 
 // GetConfig returns the prober config.
 func GetConfig() *configpb.ProberConfig {
-	cloudProber.Lock()
-	defer cloudProber.Unlock()
+	cloudProber.RLock()
+	defer cloudProber.RUnlock()
 	return cloudProber.config
 }
 
-// GetTextConfig returns the prober config in text proto format.
-func GetTextConfig() string {
-	cloudProber.Lock()
-	defer cloudProber.Unlock()
-	return cloudProber.textConfig
+// GetRawConfig returns the prober config in text proto format.
+func GetRawConfig() string {
+	cloudProber.RLock()
+	defer cloudProber.RUnlock()
+	return cloudProber.configSource.RawConfig()
+}
+
+// GetParsedConfig returns the parsed prober config.
+func GetParsedConfig() string {
+	cloudProber.RLock()
+	defer cloudProber.RUnlock()
+	return cloudProber.configSource.ParsedConfig()
 }
 
 // GetInfo returns information on all the probes, servers and surfacers.
 func GetInfo() (map[string]*probes.ProbeInfo, []*surfacers.SurfacerInfo, []*servers.ServerInfo) {
-	cloudProber.Lock()
-	defer cloudProber.Unlock()
+	cloudProber.RLock()
+	defer cloudProber.RUnlock()
 	return cloudProber.prober.Probes, cloudProber.prober.Surfacers, cloudProber.prober.Servers
+}
+
+func GetProber() *prober.Prober {
+	cloudProber.RLock()
+	defer cloudProber.RUnlock()
+	return cloudProber.prober
 }

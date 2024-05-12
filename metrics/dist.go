@@ -91,6 +91,18 @@ func NewDistributionFromProto(distProto *distpb.Dist) (*Distribution, error) {
 
 	case *distpb.Dist_ExponentialBuckets:
 		expb := distProto.GetExponentialBuckets()
+		if expb.Base == 0 {
+			expb.Base = 2
+		}
+		if expb.Base < 1.01 {
+			return nil, fmt.Errorf("exponential distribution's base (%f) should be at least 1.01", expb.Base)
+		}
+		if expb.ScaleFactor == 0 {
+			expb.ScaleFactor = 1
+		}
+		if expb.NumBuckets == 0 {
+			expb.NumBuckets = 20
+		}
 		return NewExponentialDistribution(float64(expb.GetBase()), float64(expb.GetScaleFactor()), int(expb.GetNumBuckets()))
 	}
 
@@ -108,11 +120,6 @@ func (d *Distribution) AddSample(sample float64) {
 	d.bucketCounts[d.bucketIndex(sample)]++
 	d.sum += sample
 	d.count++
-}
-
-// AddInt64 adds an int64 to the receiver distribution.
-func (d *Distribution) AddInt64(i int64) {
-	d.AddSample(float64(i))
 }
 
 // AddFloat64 adds an float64 to the receiver distribution.
@@ -326,14 +333,17 @@ func (d *Distribution) StackdriverTypedValue() *monitoring.TypedValue {
 }
 
 // Clone returns a copy of the receiver distribution.
-func (d *Distribution) Clone() Value {
+func (d *Distribution) CloneDist() *Distribution {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
 	newD := NewDistribution(d.lowerBounds[1:])
 	newD.sum = d.sum
 	newD.count = d.count
-	for i := range d.bucketCounts {
-		newD.bucketCounts[i] = d.bucketCounts[i]
-	}
+	copy(newD.bucketCounts, d.bucketCounts)
 	return newD
+}
+
+// Clone returns a copy of the receiver distribution.
+func (d *Distribution) Clone() Value {
+	return d.CloneDist()
 }

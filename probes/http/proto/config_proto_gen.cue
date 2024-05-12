@@ -1,16 +1,16 @@
 package proto
 
 import (
-	"github.com/cloudprober/cloudprober/common/oauth/proto"
-	proto_1 "github.com/cloudprober/cloudprober/common/tlsconfig/proto"
+	"github.com/cloudprober/cloudprober/internal/oauth/proto"
+	proto_1 "github.com/cloudprober/cloudprober/internal/tlsconfig/proto"
 )
 
-// Next tag: 20
+// Next tag: 21
 #ProbeConf: {
-	#ProtocolType: {"HTTP", #enumValue: 0} |
+	#Scheme: {"HTTP", #enumValue: 0} |
 		{"HTTPS", #enumValue: 1}
 
-	#ProtocolType_value: {
+	#Scheme_value: {
 		HTTP:  0
 		HTTPS: 1
 	}
@@ -38,25 +38,36 @@ import (
 		value?: string @protobuf(2,string)
 	}
 
-	// Which HTTP protocol to use
-	protocol?: #ProtocolType @protobuf(1,ProtocolType,"default=HTTP")
+	// HTTP request scheme (Corresponding target label: "scheme"). If not set, we
+	// use taget's 'scheme' label if present.
+	// Note: protocol is deprecated, use scheme instead.
+	{} | {
+		protocol: #Scheme @protobuf(1,Scheme,"default=HTTP")
+	} | {
+		scheme: #Scheme @protobuf(21,Scheme,"default=HTTP")
+	}
 
-	// Relative URL (to append to all targets). Must begin with '/'
+	// Relative URL (Corresponding target label: "path"). We construct the final
+	// URL like this:
+	// <scheme>://<host>:<port>/<relative_url>.
+	//
+	// Note that the relative_url should start with a '/'.
 	relativeUrl?: string @protobuf(2,string,name=relative_url)
 
-	// Port for HTTP requests. If not specfied, port is selected in the following
-	// order:
-	//  - If port is provided by the targets (e.g. kubernetes endpoint or
-	//    service), that port is used.
-	//  - 80 for HTTP and 443 for HTTPS.
+	// Port for HTTP requests (Corresponding target field: port)
+	// Default is to use the scheme specific port, but if this field is not
+	// set and discovered target has a port (e.g., k8s services, ingresses),
+	// we use target's port.
 	port?: int32 @protobuf(3,int32)
 
-	// Whether to resolve the target before making the request. If set to false,
-	// we hand over the target and relative_url directly to the golang's HTTP
-	// module, Otherwise, we resolve the target first to an IP address and
-	// make a request using that while passing target name as Host header.
-	// By default we resolve first if it's a discovered resource, e.g., a k8s
-	// endpoint.
+	// Whether to resolve the target before making the request. If set to true,
+	// we resolve the target first to an IP address and make a request using
+	// that while passing target name (or 'host' label if present) as Host
+	// header.
+	//
+	// This behavior is automatic for discovered targets if they have an IP
+	// address associated with them. Usually you don't need to worry about this
+	// field and you can left it unspecified. We'll ty to do the right thing.
 	resolveFirst?: bool @protobuf(4,bool,name=resolve_first)
 
 	// Export response (body) count as a metric
@@ -66,10 +77,31 @@ import (
 	method?: #Method @protobuf(7,Method,"default=GET")
 
 	// HTTP request headers
+	// It is recommended to use "header" instead of "headers" for new configs.
+	// header {
+	//   key: "Authorization"
+	//   value: "Bearer {{env "AUTH_TOKEN"}}"
+	// }
 	headers?: [...#Header] @protobuf(8,Header)
+	header?: {
+		[string]: string
+	} @protobuf(20,map[string]string)
 
-	// Request body.
-	body?: string @protobuf(9,string)
+	// Request body. This field works similar to the curl's data flag. If there
+	// are multiple "body" fields, we combine their values with a '&' in between.
+	//
+	// Also, we try to guess the content-type header based on the data:
+	// 1) If data appears to be a valid json, we automatically set the
+	//    content-type header to "application/json".
+	// 2) If the final data string appears to be a valid query string, we
+	//    set content-type to "application/x-www-form-urlencoded". Content type
+	//    header can still be overridden using the header field above.
+	// Example:
+	//  body: "grant_type=client_credentials"
+	//  body: "scope=transferMoney"
+	//  body: "clientId=aweseomeClient"
+	//  body: "clientSecret=noSecret"
+	body?: [...string] @protobuf(9,string)
 
 	// Enable HTTP keep-alive. If set to true, underlying connection is reused
 	// for further probes. Default is to close the connection after every request.
@@ -107,6 +139,44 @@ import (
 	// The maximum amount of redirects the HTTP client will follow.
 	// To disable redirects, use max_redirects: 0.
 	maxRedirects?: int32 @protobuf(18,int32,name=max_redirects)
+
+	#LatencyBreakdown: {"NO_BREAKDOWN", #enumValue: 0} |
+		{"ALL_STAGES", #enumValue: 1} | {
+			"DNS_LATENCY"// Exported as dns_latency
+			#enumValue: 2
+		} | {
+			"CONNECT_LATENCY"// Exported as connect_latency
+			#enumValue: 3
+		} | {
+			"TLS_HANDSHAKE_LATENCY"// Exported as tls_handshake_latency
+			#enumValue: 4
+		} | {
+			"REQ_WRITE_LATENCY"// Exported as req_write_latency
+			#enumValue: 5
+		} | {
+			"FIRST_BYTE_LATENCY"// Exported as first_byte_latency
+			#enumValue: 6
+		}
+
+	#LatencyBreakdown_value: {
+		NO_BREAKDOWN:          0
+		ALL_STAGES:            1
+		DNS_LATENCY:           2
+		CONNECT_LATENCY:       3
+		TLS_HANDSHAKE_LATENCY: 4
+		REQ_WRITE_LATENCY:     5
+		FIRST_BYTE_LATENCY:    6
+	}
+
+	// Add latency breakdown to probe results. This will add latency breakdown
+	// by various stages of the request processing, e.g., DNS resolution, TCP
+	// connection, TLS handshake, etc. You can select stages individually or
+	// specify "ALL_STAGES" to get breakdown for all stages.
+	//
+	// Example:
+	//   latency_breakdown: [ ALL_STAGES ]
+	//   latency_breakdown: [ DNS_LATENCY, CONNECT_LATENCY, TLS_HANDSHAKE_LATENCY ]
+	latencyBreakdown?: [...#LatencyBreakdown] @protobuf(22,LatencyBreakdown,name=latency_breakdown)
 
 	// Interval between targets.
 	intervalBetweenTargetsMsec?: int32 @protobuf(97,int32,name=interval_between_targets_msec,"default=10")

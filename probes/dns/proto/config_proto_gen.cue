@@ -84,6 +84,15 @@ package proto
 	TA:         32768
 	DLV:        32769
 }
+#DNSProto: {"UDP", #enumValue: 0} |
+	{"TCP", #enumValue: 1} |
+	{"TCP_TLS", #enumValue: 2}
+
+#DNSProto_value: {
+	UDP:     0
+	TCP:     1
+	TCP_TLS: 2
+}
 
 #ProbeConf: {
 	// Domain to use when making DNS queries
@@ -102,4 +111,23 @@ package proto
 	// default we resolve first if it's a discovered resource, e.g., a k8s
 	// endpoint.
 	resolveFirst?: bool @protobuf(5,bool,name=resolve_first)
+
+	// Which DNS protocol is used for resolution.
+	dnsProto?: #DNSProto @protobuf(97,DNSProto,name=dns_proto,"default=UDP")
+
+	// Requests per probe.
+	// Number of DNS requests per probe. Requests are executed concurrently and
+	// each DNS request contributes to probe results. For example, if you run two
+	// requests per probe, "total" counter will be incremented by 2.
+	requestsPerProbe?: int32 @protobuf(98,int32,name=requests_per_probe,"default=1")
+
+	// How long to wait between two requests to the same target. Only relevant
+	// if requests_per_probe is also configured.
+	//
+	// This value should be less than (interval - timeout) / requests_per_probe.
+	// This is to ensure that all requests are executed within one probe interval
+	// and all of them get sufficient time. For example, if probe interval is 2s,
+	// timeout is 1s, and requests_per_probe is 10,  requests_interval_msec
+	// should be less than 10ms.
+	requestsIntervalMsec?: int32 @protobuf(99,int32,name=requests_interval_msec,"default=0")
 }

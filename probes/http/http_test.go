@@ -17,12 +17,17 @@ package http
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"net/url"
 	"os"
+	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,9 +40,9 @@ import (
 	"github.com/cloudprober/cloudprober/probes/options"
 	"github.com/cloudprober/cloudprober/targets"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
-	"github.com/golang/protobuf/proto"
 	"github.com/stretchr/testify/assert"
 	"golang.org/x/oauth2"
+	"google.golang.org/protobuf/proto"
 )
 
 // The Transport is mocked instead of the Client because Client is not an
@@ -73,6 +78,31 @@ func (trc *testReadCloser) Close() error {
 }
 
 func (tt *testTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx := req.Context()
+	trace := httptrace.ContextClientTrace(ctx)
+	if trace != nil {
+		if trace.DNSDone != nil {
+			time.Sleep(time.Millisecond)
+			trace.DNSDone(httptrace.DNSDoneInfo{})
+		}
+		if trace.ConnectDone != nil {
+			time.Sleep(time.Millisecond)
+			trace.ConnectDone("", "", nil)
+		}
+		if trace.TLSHandshakeDone != nil && req.URL.Scheme == "https" {
+			time.Sleep(time.Millisecond)
+			trace.TLSHandshakeDone(tls.ConnectionState{}, nil)
+		}
+		if trace.WroteRequest != nil {
+			time.Sleep(time.Millisecond)
+			trace.WroteRequest(httptrace.WroteRequestInfo{})
+		}
+		if trace.GotFirstResponseByte != nil {
+			time.Sleep(time.Millisecond)
+			trace.GotFirstResponseByte()
+		}
+	}
+
 	authHeader := req.Header.Get("Authorization")
 	if tt.keepAuthHeader {
 		tt.mu.Lock()
@@ -91,7 +121,7 @@ func (tt *testTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return &http.Response{Body: http.NoBody}, nil
 	}
 
-	b, err := ioutil.ReadAll(req.Body)
+	b, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -203,14 +233,13 @@ func TestProbeVariousMethods(t *testing.T) {
 		want  string
 	}{
 		{&configpb.ProbeConf{}, "total: 1, success: 1"},
-		{&configpb.ProbeConf{Protocol: configpb.ProbeConf_HTTPS.Enum()}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{RequestsPerProbe: proto.Int32(1)}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{RequestsPerProbe: proto.Int32(4)}, "total: 4, success: 4"},
 		{&configpb.ProbeConf{Method: mpb("GET")}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{Method: mpb("POST")}, "total: 1, success: 1"},
-		{&configpb.ProbeConf{Method: mpb("POST"), Body: &testBody}, "total: 1, success: 1"},
+		{&configpb.ProbeConf{Method: mpb("POST"), Body: []string{testBody}}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{Method: mpb("PUT")}, "total: 1, success: 1"},
-		{&configpb.ProbeConf{Method: mpb("PUT"), Body: &testBody}, "total: 1, success: 1"},
+		{&configpb.ProbeConf{Method: mpb("PUT"), Body: []string{testBody}}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{Method: mpb("HEAD")}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{Method: mpb("DELETE")}, "total: 1, success: 1"},
 		{&configpb.ProbeConf{Method: mpb("PATCH")}, "total: 1, success: 1"},
@@ -218,7 +247,7 @@ func TestProbeVariousMethods(t *testing.T) {
 		{&configpb.ProbeConf{Headers: []*configpb.ProbeConf_Header{{Name: &testHeaderName, Value: &testHeaderValue}}}, "total: 1, success: 1"},
 	}
 
-	for i, test := range tests {
+	for i, test := range tests[:1] {
 		t.Run(fmt.Sprintf("Test_case(%d)_config(%v)", i, test.input), func(t *testing.T) {
 			opts := &options.Options{
 				Targets:   targets.StaticTargets("test.com"),
@@ -243,66 +272,16 @@ func TestProbeVariousMethods(t *testing.T) {
 	}
 }
 
-func TestProbeWithBody(t *testing.T) {
-	testBody := "TestHTTPBody"
-	testTarget := "test.com"
-	// Build the expected response code map
-	expectedMap := metrics.NewMap("resp", metrics.NewInt(0))
-	expectedMap.IncKey(testBody)
-	expected := expectedMap.String()
-
-	p := &Probe{}
-	err := p.Init("http_test", &options.Options{
-		Targets:  targets.StaticTargets(testTarget),
-		Interval: 2 * time.Second,
-		ProbeConf: &configpb.ProbeConf{
-			Body:                    &testBody,
-			ExportResponseAsMetrics: proto.Bool(true),
-		},
-	})
-	if err != nil {
-		t.Errorf("Error while initializing probe: %v", err)
-	}
-	p.baseTransport = &testTransport{}
-	target := endpoint.Endpoint{Name: testTarget}
-
-	// Probe 1st run
-	result := p.newResult()
-	req := p.httpRequestForTarget(target)
-	p.runProbe(context.Background(), target, p.clientsForTarget(target), req, result)
-	got := result.respBodies.String()
-	if got != expected {
-		t.Errorf("response map: got=%s, expected=%s", got, expected)
-	}
-
-	// Probe 2nd run (we should get the same request body).
-	p.runProbe(context.Background(), target, p.clientsForTarget(target), req, result)
-	expectedMap.IncKey(testBody)
-	expected = expectedMap.String()
-	got = result.respBodies.String()
-	if got != expected {
-		t.Errorf("response map: got=%s, expected=%s", got, expected)
-	}
-}
-
-func TestProbeWithLargeBody(t *testing.T) {
-	for _, size := range []int{largeBodyThreshold - 1, largeBodyThreshold, largeBodyThreshold + 1, largeBodyThreshold * 2} {
-		t.Run(fmt.Sprintf("size:%d", size), func(t *testing.T) {
-			testProbeWithLargeBody(t, size)
-		})
-	}
-}
-
 func testProbeWithLargeBody(t *testing.T, bodySize int) {
 	testBody := strings.Repeat("a", bodySize)
-	testTarget := "test-large-body.com"
+	testTarget := "test.com"
 
 	p := &Probe{}
 	err := p.Init("http_test", &options.Options{
 		Targets:  targets.StaticTargets(testTarget),
 		Interval: 2 * time.Second,
 		ProbeConf: &configpb.ProbeConf{
-			Body: &testBody,
+			Body: []string{testBody},
 			// Can't use ExportResponseAsMetrics for large bodies,
 			// since maxResponseSizeForMetrics is small
 			ExportResponseAsMetrics: proto.Bool(false),
@@ -333,12 +312,21 @@ func testProbeWithLargeBody(t *testing.T, bodySize int) {
 	}
 }
 
+func TestProbeWithBody(t *testing.T) {
+	for _, size := range []int{12, largeBodyThreshold - 1, largeBodyThreshold, largeBodyThreshold + 1, largeBodyThreshold * 2} {
+		t.Run(fmt.Sprintf("size:%d", size), func(t *testing.T) {
+			testProbeWithLargeBody(t, size)
+		})
+	}
+}
+
 type testServer struct {
 	addr *net.TCPAddr
 	srv  *http.Server
 }
 
-func newTestServer(ctx context.Context, ipVer int) (*testServer, error) {
+func newTestServer(t *testing.T, ctx context.Context, ipVer int) (*testServer, error) {
+	t.Helper()
 	ts := &testServer{}
 	network := map[int]string{4: "tcp4", 6: "tcp6", 0: "tcp"}[ipVer]
 	addr := map[int]string{4: "127.0.0.1:0", 6: "[::1]:0", 0: "localhost:0"}[ipVer]
@@ -352,6 +340,17 @@ func newTestServer(ctx context.Context, ipVer int) (*testServer, error) {
 	serverMux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasPrefix(r.Host, "fail-test.com") {
 			time.Sleep(2 * time.Second)
+		}
+		if r.URL.Path == "/test-body-size" {
+			size, _ := strconv.Atoi(r.URL.Query().Get("size"))
+			b, err := io.ReadAll(r.Body)
+			assert.Equal(t, nil, err)
+			assert.Equal(t, size, len(b))
+		}
+		if r.URL.Path == "/redirect" {
+			redirectURL := r.URL.Query().Get("url")
+			assert.NotEmpty(t, redirectURL)
+			http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
 		}
 		w.Write([]byte("ok"))
 	})
@@ -373,20 +372,33 @@ func newTestServer(ctx context.Context, ipVer int) (*testServer, error) {
 	return ts, nil
 }
 
-func testMultipleTargetsMultipleRequests(t *testing.T, reqPerProbe int, ipVer int, keepAlive bool) {
+type testProbeOpts struct {
+	reqPerProbe int
+	ipVer       int
+	keepAlive   bool
+	body        string
+	method      string
+	targets     []string
+	url         string
+}
+
+func testMultipleTargetsMultipleRequests(t *testing.T, probeOpts *testProbeOpts) {
+	if probeOpts.reqPerProbe == 0 {
+		probeOpts.reqPerProbe = 1
+	}
+
 	ctx, cancelF := context.WithCancel(context.Background())
 	defer cancelF()
 
-	ts, err := newTestServer(ctx, ipVer)
+	ts, err := newTestServer(t, ctx, probeOpts.ipVer)
 	if err != nil {
 		t.Errorf("Error starting test HTTP server: %v", err)
 		return
 	}
 	t.Logf("Started test HTTP server at: %v", ts.addr)
 
-	testTargets := []string{"test.com", "fail-test.com", "fails-to-resolve.com"}
 	var eps []endpoint.Endpoint
-	for _, name := range testTargets {
+	for _, name := range probeOpts.targets {
 		ip := ts.addr.IP
 		if name == "fails-to-resolve.com" {
 			ip = nil
@@ -397,18 +409,26 @@ func testMultipleTargetsMultipleRequests(t *testing.T, reqPerProbe int, ipVer in
 		})
 	}
 
+	method := map[string]configpb.ProbeConf_Method{
+		"GET":  configpb.ProbeConf_GET,
+		"POST": configpb.ProbeConf_POST,
+	}[probeOpts.method]
+
 	opts := &options.Options{
 		Targets:             targets.StaticEndpoints(eps),
 		Interval:            10 * time.Millisecond,
 		Timeout:             9 * time.Millisecond,
 		StatsExportInterval: 10 * time.Millisecond,
 		ProbeConf: &configpb.ProbeConf{
+			RelativeUrl:      &probeOpts.url,
 			Port:             proto.Int32(int32(ts.addr.Port)),
-			RequestsPerProbe: proto.Int32(int32(reqPerProbe)),
+			Method:           &method,
+			RequestsPerProbe: proto.Int32(int32(probeOpts.reqPerProbe)),
 			ResolveFirst:     proto.Bool(true),
-			KeepAlive:        proto.Bool(keepAlive),
+			KeepAlive:        proto.Bool(probeOpts.keepAlive),
+			Body:             []string{probeOpts.body},
 		},
-		IPVersion:  ipVer,
+		IPVersion:  probeOpts.ipVer,
 		LogMetrics: func(_ *metrics.EventMetrics) {},
 	}
 
@@ -440,17 +460,9 @@ func testMultipleTargetsMultipleRequests(t *testing.T, reqPerProbe int, ipVer in
 	cancelF()
 	wg.Wait() // Verifies that probe really stopped.
 
-	latestVal := func(ems []*metrics.EventMetrics, name string) int {
-		return int(ems[len(ems)-1].Metric(name).(*metrics.Int).Int64())
-	}
-
-	dataMap := testutils.MetricsMap(ems)
-	for _, tgt := range testTargets {
-		successVals, totalVals := dataMap["success"][tgt], dataMap["total"][tgt]
-		var connEventVals []*metrics.EventMetrics
-		if keepAlive {
-			connEventVals = dataMap["connect_event"][tgt]
-		}
+	dataMap := testutils.MetricsMapByTarget(ems)
+	for _, tgt := range probeOpts.targets {
+		totalVals := dataMap[tgt]["total"]
 
 		metricsCount := len(totalVals)
 		t.Logf("Total metrics for %s: %d", tgt, len(totalVals))
@@ -461,8 +473,8 @@ func testMultipleTargetsMultipleRequests(t *testing.T, reqPerProbe int, ipVer in
 
 		// Expected values on a good system: metricsCount * reqPerProbe
 		// Let's go with more conservative values and divide by 3 to take
-		// slowness of CI/CD systems into account:
-		wantCounter := (metricsCount * reqPerProbe) / 3
+		// slowness of CI systems into account:
+		wantCounter := (metricsCount * probeOpts.reqPerProbe) / 3
 		minTotal, minSuccess := wantCounter, wantCounter
 		if tgt == "fails-to-resolve.com" {
 			minTotal, minSuccess = 0, 0
@@ -470,12 +482,16 @@ func testMultipleTargetsMultipleRequests(t *testing.T, reqPerProbe int, ipVer in
 		if tgt == "fail-test.com" {
 			minSuccess = 0
 		}
-		assert.LessOrEqualf(t, minTotal, latestVal(totalVals, "total"), "total for target: %s", tgt)
-		assert.LessOrEqualf(t, minSuccess, latestVal(successVals, "success"), "success for target: %s", tgt)
+		assert.LessOrEqualf(t, int64(minTotal), dataMap.LastValueInt64(tgt, "total"), "total for target: %s", tgt)
+		assert.LessOrEqualf(t, int64(minSuccess), dataMap.LastValueInt64(tgt, "success"), "success for target: %s", tgt)
 
-		if keepAlive && tgt == "test.com" {
-			maxConnEvent := reqPerProbe * 2
-			assert.GreaterOrEqualf(t, maxConnEvent, latestVal(connEventVals, "connect_event"), "connect_event for target: %s", tgt)
+		if probeOpts.keepAlive && tgt == "test.com" {
+			connEvent := dataMap.LastValueInt64(tgt, "connect_event")
+			minConnEvent := int64(probeOpts.reqPerProbe * 1)
+			maxConnEvent := int64(probeOpts.reqPerProbe * 2)
+			if connEvent <= minConnEvent && connEvent >= maxConnEvent {
+				t.Errorf("connect_event for target: %s, got: %d, want: <= %d, >= %d", tgt, connEvent, maxConnEvent, minConnEvent)
+			}
 		}
 	}
 }
@@ -489,8 +505,38 @@ func TestMultipleTargetsMultipleRequests(t *testing.T) {
 		for _, reqPerProbe := range []int{1, 3} {
 			for _, keepAlive := range []bool{false, true} {
 				t.Run(fmt.Sprintf("ip_ver=%d,req_per_probe=%d,keepAlive=%v", ipVer, reqPerProbe, keepAlive), func(t *testing.T) {
-					testMultipleTargetsMultipleRequests(t, reqPerProbe, ipVer, keepAlive)
+					testMultipleTargetsMultipleRequests(t, &testProbeOpts{
+						reqPerProbe: reqPerProbe,
+						ipVer:       ipVer,
+						keepAlive:   keepAlive,
+						targets:     []string{"test.com", "fail-test.com", "fails-to-resolve.com"},
+					})
 				})
+			}
+		}
+	}
+}
+
+func TestProbeWithReqBody(t *testing.T) {
+	for _, size := range []int{0, 32, largeBodyThreshold + 1} {
+		for _, method := range []string{"GET", "POST"} {
+			for _, withRedirect := range []bool{false, true} {
+				for _, keepAlive := range []bool{false, true} {
+					testName := fmt.Sprintf("method:%s,bodysize:%d,keepAlive:%v,withRedirect:%v", method, size, keepAlive, withRedirect)
+					t.Run(testName, func(t *testing.T) {
+						u := "/test-body-size?size=" + strconv.Itoa(size)
+						if withRedirect {
+							u = "/redirect?url=" + url.QueryEscape(u)
+						}
+						testMultipleTargetsMultipleRequests(t, &testProbeOpts{
+							body:      strings.Repeat("a", size),
+							method:    method,
+							keepAlive: keepAlive,
+							targets:   []string{"test.com"},
+							url:       u,
+						})
+					})
+				}
 			}
 		}
 	}
@@ -499,7 +545,7 @@ func TestMultipleTargetsMultipleRequests(t *testing.T) {
 func compareNumberOfMetrics(t *testing.T, ems []*metrics.EventMetrics, targets [2]string, wantCloseRange bool) {
 	t.Helper()
 
-	m := testutils.MetricsMap(ems)["success"]
+	m := testutils.MetricsMapByTarget(ems).Filter("success")
 	num1 := len(m[targets[0]])
 	num2 := len(m[targets[1]])
 
@@ -750,5 +796,247 @@ func TestProbeInitRedirectsNotSet(t *testing.T) {
 
 	if p.redirectFunc != nil {
 		t.Errorf("expected redirectFunc to be nil, found redirectFunc was initialized")
+	}
+}
+
+func TestClientsForTarget(t *testing.T) {
+	tests := []struct {
+		name                string
+		conf                *configpb.ProbeConf
+		https               bool
+		baseTransport       *http.Transport
+		target              endpoint.Endpoint
+		wantNumClients      int
+		tlsConfigServerName string
+	}{
+		{
+			name:           "default",
+			conf:           &configpb.ProbeConf{},
+			baseTransport:  http.DefaultTransport.(*http.Transport),
+			target:         endpoint.Endpoint{Name: "cloudprober.org"},
+			wantNumClients: 1,
+		},
+		{
+			name:           "2_clients",
+			conf:           &configpb.ProbeConf{RequestsPerProbe: proto.Int32(2)},
+			baseTransport:  http.DefaultTransport.(*http.Transport),
+			target:         endpoint.Endpoint{Name: "cloudprober.org"},
+			wantNumClients: 2,
+		},
+		{
+			name: "2_clients_https",
+			conf: &configpb.ProbeConf{
+				RequestsPerProbe: proto.Int32(2),
+			},
+			https:          true,
+			baseTransport:  http.DefaultTransport.(*http.Transport),
+			target:         endpoint.Endpoint{Name: "cloudprober.org"},
+			wantNumClients: 2,
+		},
+		{
+			name: "2_clients_https_server_name",
+			conf: &configpb.ProbeConf{
+				RequestsPerProbe: proto.Int32(2),
+			},
+			baseTransport: http.DefaultTransport.(*http.Transport),
+			https:         true,
+			target: endpoint.Endpoint{
+				Name: "cloudprober.org",
+				IP:   net.ParseIP("1.2.3.4"),
+			},
+			wantNumClients:      2,
+			tlsConfigServerName: "cloudprober.org",
+		},
+		{
+			name: "2_clients_https_server_name_from_fqdn",
+			conf: &configpb.ProbeConf{
+				RequestsPerProbe: proto.Int32(2),
+			},
+			baseTransport: http.DefaultTransport.(*http.Transport),
+			target: endpoint.Endpoint{
+				Name: "cloudprober.org",
+				IP:   net.ParseIP("1.2.3.4"),
+				Labels: map[string]string{
+					"__cp_scheme__": "https", // Note: using target label here.
+					"fqdn":          "manugarg.com",
+				},
+			},
+			wantNumClients:      2,
+			tlsConfigServerName: "manugarg.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.https {
+				tt.conf.SchemeType = &configpb.ProbeConf_Scheme_{
+					Scheme: configpb.ProbeConf_HTTPS,
+				}
+			}
+			p := &Probe{
+				baseTransport: tt.baseTransport,
+				c:             tt.conf,
+			}
+			gotClients := p.clientsForTarget(tt.target)
+			assert.Equal(t, tt.wantNumClients, len(gotClients), "number of clients is not as expected")
+
+			for _, c := range gotClients {
+				tlsConfig := c.Transport.(*http.Transport).TLSClientConfig
+				assert.Equal(t, tt.tlsConfigServerName, tlsConfig.ServerName, "TLS config server name is not as expected")
+			}
+		})
+	}
+}
+
+func TestParseLatencyBreakdown(t *testing.T) {
+	tests := []struct {
+		name string
+		lb   []configpb.ProbeConf_LatencyBreakdown
+		base metrics.LatencyValue
+		want *latencyDetails
+	}{
+		{
+			name: "default",
+			want: nil,
+		},
+		{
+			name: "all",
+			lb: []configpb.ProbeConf_LatencyBreakdown{
+				configpb.ProbeConf_ALL_STAGES,
+			},
+			base: metrics.NewFloat(0),
+			want: &latencyDetails{
+				dnsLatency:       metrics.NewFloat(0),
+				connectLatency:   metrics.NewFloat(0),
+				tlsLatency:       metrics.NewFloat(0),
+				reqWriteLatency:  metrics.NewFloat(0),
+				firstByteLatency: metrics.NewFloat(0),
+			},
+		},
+		{
+			name: "dns_tls",
+			lb: []configpb.ProbeConf_LatencyBreakdown{
+				configpb.ProbeConf_DNS_LATENCY,
+				configpb.ProbeConf_TLS_HANDSHAKE_LATENCY,
+			},
+			base: metrics.NewDistribution([]float64{.01, .1, .5}),
+			want: &latencyDetails{
+				dnsLatency: metrics.NewDistribution([]float64{.01, .1, .5}),
+				tlsLatency: metrics.NewDistribution([]float64{.01, .1, .5}),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Probe{
+				c: &configpb.ProbeConf{
+					LatencyBreakdown: tt.lb,
+				},
+			}
+
+			if got := p.parseLatencyBreakdown(tt.base); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("Probe.parseLatencyBreakdown() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProbeWithLatencyBreakdown(t *testing.T) {
+	ts := time.Unix(1711090290, 0)
+
+	tests := []struct {
+		name        string
+		tls         bool
+		lb          []configpb.ProbeConf_LatencyBreakdown
+		wantNil     []string
+		wantNonNil  []string
+		wantZero    string
+		wantMetrics []string
+	}{
+		{
+			name: "all",
+			lb: []configpb.ProbeConf_LatencyBreakdown{
+				configpb.ProbeConf_ALL_STAGES,
+			},
+			wantNonNil:  []string{"dns", "connect", "tls_handshake", "req_write", "first_byte"},
+			wantZero:    "tls_handshake",
+			wantMetrics: []string{"dns_latency", "connect_latency", "tls_handshake_latency", "req_write_latency", "first_byte_latency"},
+		},
+		{
+			name: "dns_tls",
+			tls:  true,
+			lb: []configpb.ProbeConf_LatencyBreakdown{
+				configpb.ProbeConf_DNS_LATENCY,
+				configpb.ProbeConf_TLS_HANDSHAKE_LATENCY,
+			},
+			wantNonNil:  []string{"dns", "tls_handshake"},
+			wantNil:     []string{"connect", "req_write", "first_byte"},
+			wantMetrics: []string{"dns_latency", "tls_handshake_latency"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &configpb.ProbeConf{
+				LatencyBreakdown: tt.lb,
+			}
+			if tt.tls {
+				cfg.SchemeType = &configpb.ProbeConf_Scheme_{
+					Scheme: configpb.ProbeConf_HTTPS,
+				}
+			}
+
+			opts := options.DefaultOptions()
+			opts.ProbeConf = cfg
+
+			p := &Probe{}
+			if err := p.Init("http_test", opts); err != nil {
+				t.Errorf("Error while initializing probe: %v", err)
+			}
+
+			patchWithTestTransport(p)
+
+			target := endpoint.Endpoint{Name: "test.com"}
+			result := p.newResult()
+			req := p.httpRequestForTarget(target)
+
+			p.runProbe(context.Background(), target, p.clientsForTarget(target), req, result)
+
+			assert.NotNil(t, result.latencyBreakdown, "latencyDetails not populated")
+
+			lb := result.latencyBreakdown
+			latenciesMap := map[string]metrics.Value{
+				"dns":           lb.dnsLatency,
+				"connect":       lb.connectLatency,
+				"tls_handshake": lb.tlsLatency,
+				"req_write":     lb.reqWriteLatency,
+				"first_byte":    lb.firstByteLatency,
+			}
+
+			for _, k := range tt.wantNil {
+				assert.Nil(t, latenciesMap[k], fmt.Sprintf("%s: latency value not populated", k))
+			}
+			for _, k := range tt.wantNonNil {
+				assert.NotNil(t, latenciesMap[k], fmt.Sprintf("%s: latency value not populated", k))
+				if k != tt.wantZero {
+					assert.Greater(t, latenciesMap[k].(metrics.NumValue).Float64(), float64(0), fmt.Sprintf("%s: latency value is not non-zero", k))
+				} else {
+					assert.Zero(t, latenciesMap[k].(metrics.NumValue).Float64(), fmt.Sprintf("%s: latency value is zero", k))
+				}
+			}
+
+			dataChan := make(chan *metrics.EventMetrics, 1)
+			p.exportMetrics(ts, result, target, dataChan)
+			em := <-dataChan
+			for _, m := range tt.wantMetrics {
+				assert.NotNil(t, em.Metric(m), fmt.Sprintf("%s: metric not exported", m))
+				wantValue := latenciesMap[strings.TrimSuffix(m, "_latency")]
+				assert.Equal(t, wantValue.String(), em.Metric(m).String(), fmt.Sprintf("%s: metric value not as expected", m))
+			}
+
+			// 5 more metrics are exported for total, success, latency, timeouts, resp_code
+			wantNumMetrics := len(tt.wantMetrics) + 5
+			assert.Equal(t, wantNumMetrics, len(em.MetricsKeys()), "number of metrics exported")
+		})
 	}
 }

@@ -18,12 +18,14 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func newEventMetrics(sent, rcvd, rtt int64, respCodes map[string]int64) *EventMetrics {
-	respCodesVal := NewMap("code", NewInt(0))
+	respCodesVal := NewMap("code")
 	for k, v := range respCodes {
-		respCodesVal.IncKeyBy(k, NewInt(v))
+		respCodesVal.IncKeyBy(k, v)
 	}
 	em := NewEventMetrics(time.Now()).
 		AddMetric("sent", NewInt(sent)).
@@ -60,17 +62,13 @@ func verifyEventMetrics(t *testing.T, m *EventMetrics, sent, rcvd, rtt int64, re
 		}
 	}
 	for k, eVal := range respCodes {
-		if m.Metric("resp-code").(*Map).GetKey(k).Int64() != eVal {
-			t.Errorf("Unexpected metric value. Expected: %d, Got: %d", eVal, m.Metric("resp-code").(*Map).GetKey(k).Int64())
+		if m.Metric("resp-code").(*Map[int64]).GetKey(k) != eVal {
+			t.Errorf("Unexpected metric value. Expected: %d, Got: %d", eVal, m.Metric("resp-code").(*Map[int64]).GetKey(k))
 		}
 	}
 }
 
 func TestEventMetricsUpdate(t *testing.T) {
-	rttVal := NewInt(0)
-	rttVal.Str = func(i int64) string {
-		return fmt.Sprintf("%.3f", float64(i)/1000)
-	}
 	m := newEventMetrics(0, 0, 0, make(map[string]int64))
 	m.AddLabel("ptype", "http")
 
@@ -114,10 +112,6 @@ func TestEventMetricsUpdate(t *testing.T) {
 }
 
 func TestEventMetricsSubtractCounters(t *testing.T) {
-	rttVal := NewInt(0)
-	rttVal.Str = func(i int64) string {
-		return fmt.Sprintf("%.3f", float64(i)/1000)
-	}
 	m := newEventMetrics(10, 10, 1000, make(map[string]int64))
 	m.AddLabel("ptype", "http")
 
@@ -188,13 +182,13 @@ func BenchmarkEventMetricsStringer(b *testing.B) {
 }
 
 func TestAllocsPerRun(t *testing.T) {
-	respCodesVal := NewMap("code", NewInt(0))
+	respCodesVal := NewMap("code")
 	for k, v := range map[string]int64{
 		"200": 22,
 		"404": 4500,
 		"403": 4500,
 	} {
-		respCodesVal.IncKeyBy(k, NewInt(v))
+		respCodesVal.IncKeyBy(k, v)
 	}
 
 	var em *EventMetrics
@@ -211,4 +205,19 @@ func TestAllocsPerRun(t *testing.T) {
 	})
 
 	t.Logf("Average allocations per run: ForNew=%v, ForString=%v", newAvg, stringAvg)
+}
+
+func TestLatencyUnitToString(t *testing.T) {
+	tests := map[time.Duration]string{
+		0:                "us",
+		time.Second:      "s",
+		time.Millisecond: "ms",
+		time.Microsecond: "us",
+		time.Nanosecond:  "ns",
+	}
+	for latencyUnit, want := range tests {
+		t.Run(want, func(t *testing.T) {
+			assert.Equal(t, want, LatencyUnitToString(latencyUnit), "LatencyUnitToString()")
+		})
+	}
 }

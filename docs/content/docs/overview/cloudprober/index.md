@@ -1,27 +1,37 @@
 ---
+title: Overview
 menu:
   docs:
-    parent: get-started
-    weight: 1
-title: Overview
+    parent: "get-started"
+    params:
+      hide: true
 ---
 
 [![Docker Pulls](https://img.shields.io/docker/pulls/cloudprober/cloudprober.svg)](https://hub.docker.com/v2/repositories/cloudprober/cloudprober/)
-![Go Build and Test](https://github.com/google/cloudprober/workflows/Go%20Build%20and%20Test/badge.svg)
+[![Go Build and Test](https://github.com/cloudprober/cloudprober/actions/workflows/go.yml/badge.svg)](https://github.com/cloudprober/cloudprober/actions/workflows/go.yml)
 [![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=cloudprober_cloudprober&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=cloudprober_cloudprober)
 [![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=cloudprober_cloudprober&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=cloudprober_cloudprober)
 
-Cloudprober is a monitoring software that makes it super-easy to monitor
-availability and performance of various components of your system. Cloudprober
-employs the "active" monitoring model. It runs probes against (or on) your
-components to verify that they are working as expected. For example, it can run
-a probe to verify that your frontends can reach your backends. Similarly it can
-run a probe to verify that your in-Cloud VMs can actually reach your on-premise
-systems. This kind of monitoring makes it possible to monitor your systems'
-interfaces regardless of the implementation and helps you quickly pin down
-what's broken in your system.
+Cloudprober provides a reliable and easy-to-use solution to monitor the
+availability and performance of your systems. Employing an "active" monitoring
+approach, Cloudprober executes probes on or against these systems to verify
+their proper functioning.
+
+For example, you could use Cloudprober to run a probe to verify that your users
+can access your website and your APIs, your microservices can talk to each
+other, your kubernetes clusters can schedule pods, your CI/CD pipelines are
+functioning as expected, or VPN connectivity with your partners is working as
+expected, and much more.
+
+This kind of monitoring makes it possible to monitor your systems' interfaces
+regardless of the implementation, and helps you quickly pin down what's broken
+in your systems.
+
+<br/>
 
 ![Cloudprober Use Case](http://cloudprober.org/diagrams/cloudprober_use_case.svg)
+
+<br/>
 
 ## Features
 
@@ -37,22 +47,23 @@ what's broken in your system.
 * Multiple options for checks:
 
   - _Efficient, highly scalable_, built-in probes:
-    [HTTP](https://github.com/cloudprober/cloudprober/blob/master/probes/http/proto/config.proto),
-    [PING](https://github.com/cloudprober/cloudprober/blob/master/probes/ping/proto/config.proto),
-    [TCP](https://github.com/cloudprober/cloudprober/blob/master/probes/tcp/proto/config.proto),
-    [DNS](https://github.com/cloudprober/cloudprober/blob/master/probes/dns/proto/config.proto),
-    [gRPC](https://github.com/cloudprober/cloudprober/blob/master/probes/grpc/proto/config.proto),
-    [UDP](https://github.com/cloudprober/cloudprober/blob/master/probes/udp/proto/config.proto).
+    [HTTP](/docs/config/probes/#cloudprober_probes_http_ProbeConf),
+    [PING](/docs/config/probes/#cloudprober_probes_ping_ProbeConf),
+    [TCP](/docs/config/probes/#cloudprober_probes_tcp_ProbeConf),
+    [DNS](/docs/config/probes/#cloudprober_probes_dns_ProbeConf),
+    [gRPC](/docs/config/probes/#cloudprober_probes_grpc_ProbeConf),
+    [UDP](/docs/config/probes/#cloudprober_probes_udp_ProbeConf).
   - Run custom checks through the _"[external]({{< ref external-probe >}})"_
     probe type.
 
-- Automated [targets]({{< ref targets.md >}}) discovery to make Cloud
-  deployments as painless as possible:
+- Automated [targets]({{< ref "/docs/how-to/targets.md" >}}) discovery to make
+  Cloud deployments as painless as possible:
 
   - _[Kubernetes]({{< ref run-on-kubernetes.md >}}#kubernetes-targets)_
     resources.
   - _GCP_ instances, forwarding rules, and pub/sub messages.
-  - _[File]({{< ref targets.md >}}#file-based-targets)_ based targets.
+  - _[File]({{< ref "/docs/how-to/targets.md" >}}#file-based-targets)_ based
+    targets.
 
 * Deployment friendly:
 

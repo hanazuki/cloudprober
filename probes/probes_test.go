@@ -1,4 +1,4 @@
-// Copyright 2017 The Cloudprober Authors.
+// Copyright 2017-2023 The Cloudprober Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,19 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// This file is for external tests of the probe packages, created to provide
+// tests for the probe extensions.
+
 package probes_test
 
 import (
 	"context"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/cloudprober/cloudprober/metrics"
 	"github.com/cloudprober/cloudprober/probes"
 	"github.com/cloudprober/cloudprober/probes/options"
 	configpb "github.com/cloudprober/cloudprober/probes/proto"
 	testdatapb "github.com/cloudprober/cloudprober/probes/testdata"
 	targetspb "github.com/cloudprober/cloudprober/targets/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 var testProbeIntialized int
@@ -56,10 +59,7 @@ func TestGetExtensionProbe(t *testing.T) {
 	//      name: "fancy"
 	//    }
 	// }
-	err := proto.SetExtension(probeDef, testdatapb.E_FancyProbe, &testdatapb.FancyProbe{Name: proto.String("fancy")})
-	if err != nil {
-		t.Fatalf("error setting up extension in test probe proto: %v", err)
-	}
+	proto.SetExtension(probeDef, testdatapb.E_FancyProbe, &testdatapb.FancyProbe{Name: proto.String("fancy")})
 	probeInfo, err := probes.CreateProbe(probeDef, &options.Options{})
 	if err == nil {
 		t.Errorf("Expected error in building probe from extensions, got probe: %v", probeInfo)

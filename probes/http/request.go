@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The Cloudprober Authors.
+// Copyright 2019-2023 The Cloudprober Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,29 +16,20 @@ package http
 
 import (
 	"fmt"
-	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 
+	"github.com/cloudprober/cloudprober/common/iputils"
+	"github.com/cloudprober/cloudprober/internal/httpreq"
+	"github.com/cloudprober/cloudprober/logger"
+	configpb "github.com/cloudprober/cloudprober/probes/http/proto"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
+	"golang.org/x/oauth2"
 )
 
 const relURLLabel = "relative_url"
-
-// requestBody encapsulates the request body and implements the io.Reader()
-// interface.
-type requestBody struct {
-	b []byte
-}
-
-// Read implements the io.Reader interface. Instead of using buffered read,
-// it simply copies the bytes to the provided slice in one go (depending on
-// the input slice capacity) and returns io.EOF. Buffered reads require
-// resetting the buffer before re-use, restricting our ability to use the
-// request object concurrently.
-func (rb *requestBody) Read(p []byte) (int, error) {
-	return copy(p, rb.b), io.EOF
-}
 
 func hostWithPort(host string, port int) string {
 	if port == 0 {
@@ -47,40 +38,111 @@ func hostWithPort(host string, port int) string {
 	return fmt.Sprintf("%s:%d", host, port)
 }
 
-// hostHeaderForTarget computes request's Host header for a target.
-//  - If host header is set in the probe, it overrides everything else.
-//  - If target's fqdn is provided in its labels, use that along with the port.
-//  - Finally, use target's name with port.
-func hostHeaderForTarget(target endpoint.Endpoint, probeHostHeader string, port int) string {
-	if probeHostHeader != "" {
-		return probeHostHeader
+// Put square brackets around literal IPv6 hosts.
+func handleIPv6(host string) string {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return host
 	}
-
-	if target.Labels["fqdn"] != "" {
-		return hostWithPort(target.Labels["fqdn"], port)
+	if iputils.IPVersion(ip) == 6 {
+		return "[" + host + "]"
 	}
-
-	return hostWithPort(target.Name, port)
+	return host
 }
 
-func urlHostForTarget(target endpoint.Endpoint) string {
-	if target.Labels["fqdn"] != "" {
-		return target.Labels["fqdn"]
+func (p *Probe) schemeForTarget(target endpoint.Endpoint) string {
+	switch p.c.SchemeType.(type) {
+	case *configpb.ProbeConf_Scheme_:
+		return strings.ToLower(p.c.GetScheme().String())
+	case *configpb.ProbeConf_Protocol:
+		return strings.ToLower(p.c.GetProtocol().String())
 	}
 
-	return target.Name
+	for _, label := range []string{"__cp_scheme__"} {
+		if target.Labels[label] != "" {
+			return strings.ToLower(target.Labels[label])
+		}
+	}
+
+	return "http"
 }
 
-func relURLForTarget(target endpoint.Endpoint, probeURL string) string {
+func hostForTarget(target endpoint.Endpoint) string {
+	for _, label := range []string{"fqdn", "__cp_host__"} {
+		if target.Labels[label] != "" {
+			return handleIPv6(target.Labels[label])
+		}
+	}
+
+	return handleIPv6(target.Name)
+}
+
+func pathForTarget(target endpoint.Endpoint, probeURL string) string {
 	if probeURL != "" {
 		return probeURL
 	}
 
-	if target.Labels[relURLLabel] != "" {
-		return target.Labels[relURLLabel]
+	for _, label := range []string{relURLLabel, "__cp_path__"} {
+		if path := target.Labels[label]; path != "" {
+			if !strings.HasPrefix(path, "/") {
+				return "/" + path
+			}
+			return path
+		}
 	}
 
 	return ""
+}
+
+func (p *Probe) resolveFirst(target endpoint.Endpoint) bool {
+	if p.c.ResolveFirst != nil {
+		return p.c.GetResolveFirst()
+	}
+	return target.IP != nil
+}
+
+// setHeaders computes setHeaders for a target. Host header is computed slightly
+// differently than other setHeaders.
+//   - If host header is set in the probe, it overrides everything else.
+//   - Otherwise we use target's host (computed elsewhere) along with port.
+func (p *Probe) setHeaders(req *http.Request, host string, port int) {
+	var hostHeader string
+
+	for _, h := range p.c.GetHeaders() {
+		if h.GetName() == "Host" {
+			hostHeader = h.GetValue()
+			continue
+		}
+		req.Header.Set(h.GetName(), h.GetValue())
+	}
+
+	for k, v := range p.c.GetHeader() {
+		if k == "Host" {
+			hostHeader = v
+			continue
+		}
+		req.Header.Set(k, v)
+	}
+
+	if hostHeader == "" {
+		hostHeader = hostWithPort(host, port)
+	}
+	req.Host = hostHeader
+}
+
+func (p *Probe) urlHostAndIPLabel(target endpoint.Endpoint, host string) (string, string, error) {
+	if !p.resolveFirst(target) {
+		return host, "", nil
+	}
+
+	ip, err := target.Resolve(p.opts.IPVersion, p.opts.Targets, endpoint.WithNameOverride(host))
+	if err != nil {
+		return "", "", fmt.Errorf("error resolving target: %s, %v", target.Name, err)
+	}
+
+	ipStr := ip.String()
+
+	return handleIPv6(ipStr), ipStr, nil
 }
 
 func (p *Probe) httpRequestForTarget(target endpoint.Endpoint) *http.Request {
@@ -91,68 +153,80 @@ func (p *Probe) httpRequestForTarget(target endpoint.Endpoint) *http.Request {
 		port = target.Port
 	}
 
-	urlHost := urlHostForTarget(target)
-	ipForLabel := ""
+	host := hostForTarget(target)
 
-	resolveFirst := false
-	if p.c.ResolveFirst != nil {
-		resolveFirst = p.c.GetResolveFirst()
-	} else {
-		resolveFirst = target.IP != nil
-	}
-	if resolveFirst {
-		ip, err := target.Resolve(p.opts.IPVersion, p.opts.Targets)
-		if err != nil {
-			p.l.Error("target: ", target.Name, ", resolve error: ", err.Error())
-			return nil
-		}
-
-		ipStr := ip.String()
-		urlHost, ipForLabel = ipStr, ipStr
+	urlHost, ipForLabel, err := p.urlHostAndIPLabel(target, host)
+	if err != nil {
+		// We just return a nil request. The caller will skip nil requests.
+		p.l.Error(err.Error())
+		return nil
 	}
 
 	for _, al := range p.opts.AdditionalLabels {
 		al.UpdateForTarget(target, ipForLabel, port)
 	}
 
-	// Put square brackets around literal IPv6 hosts. This is the same logic as
-	// net.JoinHostPort, but we cannot use net.JoinHostPort as it works only for
-	// non default ports.
-	if strings.IndexByte(urlHost, ':') >= 0 {
-		urlHost = "[" + urlHost + "]"
-	}
+	url := fmt.Sprintf("%s://%s%s", p.schemeForTarget(target), hostWithPort(urlHost, port), pathForTarget(target, p.url))
 
-	url := fmt.Sprintf("%s://%s%s", p.protocol, hostWithPort(urlHost, port), relURLForTarget(target, p.url))
-
-	// Prepare request body
-	var body io.Reader
-	if len(p.requestBody) > 0 {
-		body = &requestBody{p.requestBody}
-	}
-	req, err := http.NewRequest(p.method, url, body)
+	req, err := httpreq.NewRequest(p.method, url, p.requestBody)
 	if err != nil {
 		p.l.Error("target: ", target.Name, ", error creating HTTP request: ", err.Error())
 		return nil
 	}
 
-	req.ContentLength = int64(len(p.requestBody))
-
-	var probeHostHeader string
-	for _, header := range p.c.GetHeaders() {
-		if header.GetName() == "Host" {
-			probeHostHeader = header.GetValue()
-			continue
-		}
-		req.Header.Set(header.GetName(), header.GetValue())
-	}
-
-	// Host header is set by http.NewRequest based on the URL, update it based
-	// on various conditions.
-	req.Host = hostHeaderForTarget(target, probeHostHeader, port)
-
+	p.setHeaders(req, host, port)
 	if p.c.GetUserAgent() != "" {
 		req.Header.Set("User-Agent", p.c.GetUserAgent())
 	}
+
+	return req
+}
+
+func getToken(ts oauth2.TokenSource, l *logger.Logger) (string, error) {
+	tok, err := ts.Token()
+	if err != nil {
+		return "", err
+	}
+	l.Debug("Got OAuth token, len: ", strconv.FormatInt(int64(len(tok.AccessToken)), 10), ", expirationTime: ", tok.Expiry.String())
+
+	if tok.AccessToken != "" {
+		return tok.AccessToken, nil
+	}
+
+	idToken, ok := tok.Extra("id_token").(string)
+	if ok {
+		return idToken, nil
+	}
+
+	return "", fmt.Errorf("got unknown token: %v", tok)
+}
+
+func (p *Probe) prepareRequest(req *http.Request) *http.Request {
+	// We clone the request for the cases where we modify the request:
+	//   -- if request has a body, each request gets its own Body
+	//      as HTTP transport reads body in a streaming fashion, and we can't
+	//      share it across multiple requests.
+	//   -- if OAuth token is used, each request gets its own Authorization
+	//      header.
+	if p.oauthTS == nil && p.requestBody.Len() == 0 {
+		return req
+	}
+
+	req = req.Clone(req.Context())
+
+	if p.oauthTS != nil {
+		tok, err := getToken(p.oauthTS, p.l)
+		// Note: We don't terminate the request if there is an error in getting
+		// token. That is to avoid complicating the flow, and to make sure that
+		// OAuth refresh failures show in probe failures.
+		if err != nil {
+			p.l.Error("Error getting OAuth token: ", err.Error())
+			tok = "<token-missing>"
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
+	}
+
+	req.Body = p.requestBody.Reader()
 
 	return req
 }

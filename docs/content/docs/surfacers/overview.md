@@ -1,31 +1,51 @@
 ---
+title: "Exporting Metrics (Surfacers)"
 menu:
   docs:
     parent: "surfacers"
-    weight: 20
-title: "Surfacers"
+    weight: 10
 ---
 
-One of the biggest strengths of cloudprober is that it can export data to multiple monitoring systems, even simultaneously, just based on simple configuration. Cloudprober does that using a built-in mechanism, called surfacers. Each surfacer type implements interface for a specific monitoring system, for example, [_pubsub_](https://github.com/cloudprober/cloudprober/blob/master/surfacers/prometheus/proto/config.proto) surfacer publishes data to Google Pub/Sub. You can configure multiple surfacers at the same time. If you don't specify any surfacer, [_prometheus_](https://github.com/cloudprober/cloudprober/blob/master/surfacers/prometheus/proto/config.proto) and [_file_](https://github.com/cloudprober/cloudprober/blob/master/surfacers/file/proto/config.proto) surfacers are enabled automatically.
-
-Why other monitoring systems? Cloudprober's main purpose is to run probes and build standard, usable metrics based on the results of those probes. It doesn't take any action on the generated data. Instead, it provides an easy interface to make that probe data available to systems that provide ways to consume monitoring data, for example for graphing and alerting.
+One of the biggest strengths of cloudprober is that it can export data to
+multiple monitoring systems, even simultaneously, just based on simple
+configuration. Cloudprober does that using a built-in mechanism, called
+surfacers. Each surfacer type implements interface for a specific monitoring
+system, for example,
+[_cloudwatch_](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_cloudwatch_SurfacerConf)
+surfacer publishes data to AWS Cloudwatch. You can configure multiple surfacers
+at the same time. If you don't specify any surfacer,
+[_prometheus_](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_prometheus_SurfacerConf)
+and
+[_file_](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_file_SurfacerConf)
+surfacers are enabled automatically.
 
 Cloudprober currently supports following surfacer types:
 
-- Prometheus ([config](https://github.com/cloudprober/cloudprober/blob/master/surfacers/prometheus/proto/config.proto))
-- [Stackdriver (Google Cloud Monitoring)](/surfacers/stackdriver)
-- Google Pub/Sub ([config](https://github.com/cloudprober/cloudprober/blob/master/surfacers/pubsub/proto/config.proto))
-- Postgres ([config](https://github.com/cloudprober/cloudprober/blob/master/surfacers/postgres/proto/config.proto))
-- File ([config](https://github.com/cloudprober/cloudprober/blob/master/surfacers/file/proto/config.proto))
-- [Cloudwatch (AWS Cloud Monitoring)](/surfacers/cloudwatch)
+- Prometheus
+  ([config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_prometheus_SurfacerConf))
+- OpenTelemetry (OTEL)
+  ([config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_otel_SurfacerConf))
+  [New in v0.13.2]
+- [Stackdriver (Google Cloud Monitoring)](../stackdriver)
+- Google Pub/Sub
+  ([config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_pubsub_SurfacerConf))
+- Postgres
+  ([config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_postgres_SurfacerConf))
+- File
+  ([config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_file_SurfacerConf))
+- [Cloudwatch (AWS Cloud Monitoring)](../cloudwatch)
 
-Source: [surfacers config](https://github.com/cloudprober/cloudprober/blob/7bc30b62e42f3fe4e8a2fb8cd0e87ea18b73aeb8/surfacers/proto/config.proto#L14).
+Overall
+[surfacers config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_SurfacerDef).
 
-It's easy to add more surfacers without having to understand the internals of cloudprober. You only need to implement the [Surfacer interface](https://github.com/cloudprober/cloudprober/blob/7bc30b62e42f3fe4e8a2fb8cd0e87ea18b73aeb8/surfacers/surfacers.go#L87).
+It's easy to add more surfacers without having to understand the internals of
+cloudprober. You only need to implement the
+[Surfacer interface](https://github.com/cloudprober/cloudprober/blob/7bc30b62e42f3fe4e8a2fb8cd0e87ea18b73aeb8/surfacers/surfacers.go#L87).
 
 ## Configuration
 
-Adding surfacers to cloudprober is as easy as adding "surfacer" config stanzas to your config, like the following:
+Adding surfacers to cloudprober is as easy as adding "surfacer" config stanzas
+to your config, like the following:
 
 ```shell
 # Enable prometheus and stackdriver surfacers.
@@ -42,27 +62,31 @@ surfacer {
   }
 }
 
-# Stackdriver (Google Cloud Monitoring) surfacer. No other configuration
+# Stackdriver (Google Cloud Monitoring) surfacer_ No other configuration
 # is necessary if running on GCP.
 surfacer {
   type: STACKDRIVER
 }
 ```
 
-### Filtering Metrics
+## Filtering Metrics
 
-It is possible to filter the metrics that the surfacers receive.
+You can control which metrics are published to a surfacer using the filtering
+mechanisms. For example, you may want to publish only specific metrics to AWS
+Cloudwatch to save on the costs.
 
-#### Filtering by Label
+### Filtering by Label
 
-Cloudprober can filter the metrics that are published to surfacers. To filter metrics by labels, reference one of the following keys in the surfacer configuration:
+To filter metrics by labels, use one of the following options in the
+[surfacers config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_SurfacerDef):
 
-- `allow_metrics_with_label`
-- `ignore_metrics_with_label`
+- `allow_metrics_with_label` (`allowMetricsWithLabel` in yaml)
+- `ignore_metrics_with_label` (`ignoreMetricsWithLabel` in yaml)
 
-_Note: `ignore_metrics_with_label` takes precedence over `allow_metrics_with_label`._
+_Note: `ignore_metrics_with_label` takes precedence over
+`allow_metrics_with_label`._
 
-For example, to ignore all sysvar metrics:
+For example, to ignore all `sysvar` metrics:
 
 ```
 surfacer {
@@ -90,18 +114,14 @@ surfacer {
 
 #### Filtering by Metric Name
 
-For certain surfacers, cloudprober can filter the metrics that are published by name. The surfacers that support this functionality are:
+To filter metrics by name, use one of the following options in the
+[surfacers config](https://cloudprober.org/docs/config/surfacer/#cloudprober_surfacer_SurfacerDef):
 
-- Cloudwatch
-- Prometheus
-- Stackdriver
+- `allow_metrics_with_name ` (`allowMetricsWithName` in yaml)
+- `ignore_metrics_with_name` (`ignoreMetricsWithName` in yaml)
 
-Within the surfacer configuration, the following options are defined:
-
-- `allow_metrics_with_name`
-- `ignore_metrics_with_name`
-
-_Note: `ignore_metrics_with_name` takes precedence over `allow_metrics_with_name`._
+_Note: `ignore_metrics_with_name` takes precedence over
+`allow_metrics_with_name`._
 
 To filter out all `validation_failure` metrics by name:
 
@@ -113,4 +133,38 @@ surfacer {
 }
 ```
 
-(Source: https://github.com/cloudprober/cloudprober/blob/master/surfacers/proto/config.proto)
+## Modifying Metrics
+
+You can configure surfacers to modify the metrics before they are sent to the
+backend monitoring system:
+
+1. **add_failure_metric**: Export failure count along with the default _total_
+   and _success_ metrics:
+
+   ```
+   surfacer {
+      type: ...
+
+      add_failure_metric = true
+      ..
+   }
+   ```
+
+   _NOTE: This option is now enabled by default for all surfacers, except for
+   FILE and PUBSUB surfacers._
+
+2. **export_as_gauge**: Export gauge metrics instead of cumulative. Cloudprober
+   exports cumulative metrics (sum of values so far) by default, but you can
+   configure it to export gauge metrics instead. Gauge metrics make
+   point-in-time calculations easier (e.g. you can just divide latency by
+   success to get the average latency), but we lose the historical information
+   if metrics are not received for a few intervals for some reason.
+
+   ```
+   surfacer {
+      type: ...
+
+      export_as_gauge = true
+      ..
+   }
+   ```

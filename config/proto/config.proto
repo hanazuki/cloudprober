@@ -2,15 +2,23 @@ syntax = "proto2";
 
 package cloudprober;
 
-import "github.com/cloudprober/cloudprober/common/tlsconfig/proto/config.proto";
+import "github.com/cloudprober/cloudprober/internal/tlsconfig/proto/config.proto";
 import "github.com/cloudprober/cloudprober/probes/proto/config.proto";
-import "github.com/cloudprober/cloudprober/rds/server/proto/config.proto";
-import "github.com/cloudprober/cloudprober/servers/proto/config.proto";
+import "github.com/cloudprober/cloudprober/internal/rds/server/proto/config.proto";
+import "github.com/cloudprober/cloudprober/internal/servers/proto/config.proto";
 import "github.com/cloudprober/cloudprober/surfacers/proto/config.proto";
 import "github.com/cloudprober/cloudprober/targets/proto/targets.proto";
 
 option go_package = "github.com/cloudprober/cloudprober/config/proto";
 
+// Cloudprober config proto defines the config schema. Cloudprober config can
+// either be in YAML or textproto format.
+//
+// Cloudprober uses Go text templates along with Sprig functions[1] to add
+// programming capabilities to the configs.
+// [1]- http://masterminds.github.io/sprig/
+// Config template examples:
+// https://github.com/cloudprober/cloudprober/tree/master/examples/templates
 message ProberConfig {
   // Probes to run.
   repeated probes.ProbeDef probe = 1;
@@ -31,14 +39,12 @@ message ProberConfig {
   repeated servers.ServerDef server = 3;
 
   // Shared targets allow you to re-use the same targets copy across multiple
-  // probes. Example usage:
-  //
+  // probes.
+  // Example:
   // shared_targets {
   //   name: "internal-vms"
   //   targets {
-  //     rds_targets {
-  //       ..
-  //     }
+  //     rds_targets {...}
   //   }
   // }
   //
@@ -79,12 +85,12 @@ message ProberConfig {
 
   // TLS config, it can be used to:
   // - Specify client's CA cert for client cert verification:
-  //     tls_config {
+  //     grpc_tls_config {
   //       ca_cert_file: "...."
   //     }
   //
   // - Specify TLS cert and key:
-  //     tls_config {
+  //     grpc_tls_config {
   //       tls_cert_file: "..."
   //       tls_key_file: "..."
   //     }
@@ -101,7 +107,7 @@ message ProberConfig {
   optional bool disable_jitter = 102 [default = false];
 
   // How often to export system variables. To learn more about system variables:
-  // http://godoc.org/github.com/cloudprober/cloudprober/sysvars.
+  // http://godoc.org/github.com/cloudprober/cloudprober/internal/sysvars.
   optional int32 sysvars_interval_msec = 97 [default = 10000];
 
   // Variables specified in this environment variable are exported as it is.

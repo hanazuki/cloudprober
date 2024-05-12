@@ -1,14 +1,16 @@
 package proto
 
 import (
-	"github.com/cloudprober/cloudprober/surfacers/prometheus/proto"
-	proto_1 "github.com/cloudprober/cloudprober/surfacers/stackdriver/proto"
-	proto_5 "github.com/cloudprober/cloudprober/surfacers/file/proto"
-	proto_A "github.com/cloudprober/cloudprober/surfacers/postgres/proto"
-	proto_8 "github.com/cloudprober/cloudprober/surfacers/pubsub/proto"
-	proto_E "github.com/cloudprober/cloudprober/surfacers/cloudwatch/proto"
-	proto_B "github.com/cloudprober/cloudprober/surfacers/datadog/proto"
-	proto_36 "github.com/cloudprober/cloudprober/surfacers/probestatus/proto"
+	"github.com/cloudprober/cloudprober/surfacers/internal/prometheus/proto"
+	proto_1 "github.com/cloudprober/cloudprober/surfacers/internal/stackdriver/proto"
+	proto_5 "github.com/cloudprober/cloudprober/surfacers/internal/file/proto"
+	proto_A "github.com/cloudprober/cloudprober/surfacers/internal/postgres/proto"
+	proto_8 "github.com/cloudprober/cloudprober/surfacers/internal/pubsub/proto"
+	proto_E "github.com/cloudprober/cloudprober/surfacers/internal/cloudwatch/proto"
+	proto_B "github.com/cloudprober/cloudprober/surfacers/internal/datadog/proto"
+	proto_36 "github.com/cloudprober/cloudprober/surfacers/internal/probestatus/proto"
+	proto_9 "github.com/cloudprober/cloudprober/surfacers/internal/bigquery/proto"
+	proto_3 "github.com/cloudprober/cloudprober/surfacers/internal/otel/proto"
 )
 
 // Enumeration for each type of surfacer we can parse and create
@@ -22,11 +24,12 @@ import (
 		#enumValue: 6
 	} | {
 		"DATADOG"// Experimental mode.
-		#enumValue: 7
-	} | {
-		"PROBESTATUS"// Experimental mode.
-						#enumValue: 8
-	} | {"USER_DEFINED", #enumValue: 99}
+					#enumValue: 7
+	} | {"PROBESTATUS", #enumValue: 8} | {
+		"BIGQUERY"// Experimental mode.
+					#enumValue: 9
+	} | {"OTEL", #enumValue: 10} |
+	{"USER_DEFINED", #enumValue: 99}
 
 #Type_value: {
 	NONE:         0
@@ -38,6 +41,8 @@ import (
 	CLOUDWATCH:   6
 	DATADOG:      7
 	PROBESTATUS:  8
+	BIGQUERY:     9
+	OTEL:         10
 	USER_DEFINED: 99
 }
 
@@ -87,13 +92,13 @@ import (
 	//
 	// For efficiency reasons, filtering by metric name has to be implemented by
 	// individual surfacers (while going through metrics within an EventMetrics).
-	// Currently following surfacers implement it:
-	//     CLOUDWATCH, PROMETHEUS, STACKDRIVER
+	// As FILE and PUBSUB surfacers export eventmetrics as is, they don't support
+	// this option.
 	allowMetricsWithName?:  string @protobuf(6,string,name=allow_metrics_with_name)
 	ignoreMetricsWithName?: string @protobuf(7,string,name=ignore_metrics_with_name)
 
-	// Whether to add failure metric or not. For stackdriver surfacer, we add
-	// failure metric by default.
+	// Whether to add failure metric or not. This option is enabled by default
+	// for all surfacers except FILE and PUBSUB.
 	addFailureMetric?: bool @protobuf(8,bool,name=add_failure_metric)
 
 	// If set to true, cloudprober will export all metrics as gauge metrics. Note
@@ -104,6 +109,10 @@ import (
 	// However, it should not be noticeable unless you're producing large number
 	// of metrics (say > 10000 metrics per second).
 	exportAsGauge?: bool @protobuf(9,bool,name=export_as_gauge)
+
+	// Latency metric name pattern, used to identify latency metrics, and add
+	// EventMetric's LatencyUnit to it.
+	latencyMetricPattern?: string @protobuf(51,string,name=latency_metric_pattern,#"default="^(.+_|)latency$""#)
 	// Matching surfacer specific configuration (one for each type in the above
 	// enum)
 	{} | {
@@ -122,5 +131,9 @@ import (
 		datadogSurfacer: proto_B.#SurfacerConf @protobuf(16,datadog.SurfacerConf,name=datadog_surfacer)
 	} | {
 		probestatusSurfacer: proto_36.#SurfacerConf @protobuf(17,probestatus.SurfacerConf,name=probestatus_surfacer)
+	} | {
+		bigquerySurfacer: proto_9.#SurfacerConf @protobuf(18,bigquery.SurfacerConf,name=bigquery_surfacer)
+	} | {
+		otelSurfacer: proto_3.#SurfacerConf @protobuf(19,otel.SurfacerConf,name=otel_surfacer)
 	}
 }

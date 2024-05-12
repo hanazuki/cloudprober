@@ -20,7 +20,8 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"log/slog"
 	"math/rand"
 	"net"
 	"net/http"
@@ -29,16 +30,18 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/cloudprober/cloudprober/common/oauth"
-	"github.com/cloudprober/cloudprober/common/tlsconfig"
+	"github.com/cloudprober/cloudprober/internal/httpreq"
+	"github.com/cloudprober/cloudprober/internal/oauth"
+	"github.com/cloudprober/cloudprober/internal/tlsconfig"
+	"github.com/cloudprober/cloudprober/internal/validators"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
 	configpb "github.com/cloudprober/cloudprober/probes/http/proto"
 	"github.com/cloudprober/cloudprober/probes/options"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
-	"github.com/cloudprober/cloudprober/validators"
 	"golang.org/x/oauth2"
 )
 
@@ -64,11 +67,10 @@ type Probe struct {
 	redirectFunc  func(req *http.Request, via []*http.Request) error
 
 	// book-keeping params
-	targets  []endpoint.Endpoint
-	protocol string
-	method   string
-	url      string
-	oauthTS  oauth2.TokenSource
+	targets []endpoint.Endpoint
+	method  string
+	url     string
+	oauthTS oauth2.TokenSource
 
 	// How often to resolve targets (in probe counts), it's the minimum of
 	targetsUpdateInterval time.Duration
@@ -82,35 +84,22 @@ type Probe struct {
 	cancelFuncs map[string]context.CancelFunc
 	waitGroup   sync.WaitGroup
 
-	requestBody []byte
+	requestBody *httpreq.RequestBody
+}
+
+type latencyDetails struct {
+	dnsLatency, connectLatency, tlsLatency, reqWriteLatency, firstByteLatency metrics.LatencyValue
 }
 
 type probeResult struct {
 	total, success, timeouts     int64
 	connEvent                    int64
-	latency                      metrics.Value
-	respCodes                    *metrics.Map
-	respBodies                   *metrics.Map
-	validationFailure            *metrics.Map
+	latency                      metrics.LatencyValue
+	respCodes                    *metrics.Map[int64]
+	respBodies                   *metrics.Map[int64]
+	validationFailure            *metrics.Map[int64]
+	latencyBreakdown             *latencyDetails
 	sslEarliestExpirationSeconds int64
-}
-
-func (p *Probe) oauthToken() (string, error) {
-	tok, err := p.oauthTS.Token()
-	if err != nil {
-		return "", err
-	}
-	p.l.Debug("Got OAuth token, len: ", strconv.FormatInt(int64(len(tok.AccessToken)), 10), ", expirationTime: ", tok.Expiry.String())
-
-	if tok.AccessToken != "" {
-		return tok.AccessToken, nil
-	}
-	idToken, ok := tok.Extra("id_token").(string)
-	if ok {
-		return idToken, nil
-	}
-
-	return "", fmt.Errorf("got unknown token: %v", tok)
 }
 
 func (p *Probe) getTransport() (*http.Transport, error) {
@@ -199,7 +188,6 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 			totalDuration, p.opts.Interval)
 	}
 
-	p.protocol = strings.ToLower(p.c.GetProtocol().String())
 	p.method = p.c.GetMethod().String()
 
 	p.url = p.c.GetRelativeUrl()
@@ -207,7 +195,7 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 		return fmt.Errorf("invalid relative URL: %s, must begin with '/'", p.url)
 	}
 
-	p.requestBody = []byte(p.c.GetBody())
+	p.requestBody = httpreq.NewRequestBody(p.c.GetBody()...)
 
 	if p.c.GetOauthConfig() != nil {
 		oauthTS, err := oauth.TokenSourceFromConfig(p.c.GetOauthConfig(), p.l)
@@ -264,44 +252,57 @@ func isClientTimeout(err error) bool {
 	return false
 }
 
+func (p *Probe) addLatency(latency metrics.LatencyValue, start time.Time) {
+	latency.AddFloat64(time.Since(start).Seconds() / p.opts.LatencyUnit.Seconds())
+}
+
 // httpRequest executes an HTTP request and updates the provided result struct.
 func (p *Probe) doHTTPRequest(req *http.Request, client *http.Client, targetName string, result *probeResult, resultMu *sync.Mutex) {
-	// We clone the request for the cases where we modify the request.
-	if len(p.requestBody) >= largeBodyThreshold || p.oauthTS != nil {
-		req = req.Clone(req.Context())
-	}
+	req = p.prepareRequest(req)
 
-	if len(p.requestBody) >= largeBodyThreshold {
-		req.Body = ioutil.NopCloser(bytes.NewReader(p.requestBody))
-	}
-	if p.oauthTS != nil {
-		tok, err := p.oauthToken()
-		// Note: We don't terminate the request if there is an error in getting
-		// token. That is to avoid complicating the flow, and to make sure that
-		// OAuth refresh failures show in probe failures.
-		if err != nil {
-			p.l.Error("Error getting OAuth token: ", err.Error())
-			tok = "<token-missing>"
+	start := time.Now()
+
+	trace := &httptrace.ClientTrace{}
+
+	if lb := result.latencyBreakdown; lb != nil {
+		if lb.dnsLatency != nil {
+			trace.DNSDone = func(_ httptrace.DNSDoneInfo) { p.addLatency(lb.dnsLatency, start) }
 		}
-		req.Header.Set("Authorization", "Bearer "+tok)
+		if lb.connectLatency != nil {
+			trace.ConnectDone = func(_, _ string, _ error) { p.addLatency(lb.connectLatency, start) }
+		}
+		if lb.tlsLatency != nil {
+			trace.TLSHandshakeDone = func(_ tls.ConnectionState, _ error) { p.addLatency(lb.tlsLatency, start) }
+		}
+		if lb.reqWriteLatency != nil {
+			trace.WroteRequest = func(_ httptrace.WroteRequestInfo) { p.addLatency(lb.reqWriteLatency, start) }
+		}
+		if lb.firstByteLatency != nil {
+			trace.GotFirstResponseByte = func() { p.addLatency(lb.firstByteLatency, start) }
+		}
 	}
 
-	connEvent := 0
+	var connEvent atomic.Int32
+
 	if p.c.GetKeepAlive() {
-		trace := &httptrace.ClientTrace{
-			ConnectDone: func(_, addr string, err error) {
-				connEvent++
-				if err != nil {
-					p.l.Warning("Error establishing a new connection to: ", addr, ". Err: ", err.Error())
-					return
-				}
-				p.l.Info("Established a new connection to: ", addr)
-			},
+		oldConnectDone := trace.ConnectDone
+		trace.ConnectDone = func(network, addr string, err error) {
+			connEvent.Add(1)
+			if oldConnectDone != nil {
+				oldConnectDone(network, addr, err)
+			}
+			if err != nil {
+				p.l.Warning("Error establishing a new connection to: ", addr, ". Err: ", err.Error())
+				return
+			}
+			p.l.Info("Established a new connection to: ", addr)
 		}
+	}
+
+	if trace != nil {
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), trace))
 	}
 
-	start := time.Now()
 	resp, err := client.Do(req)
 	latency := time.Since(start)
 
@@ -312,21 +313,21 @@ func (p *Probe) doHTTPRequest(req *http.Request, client *http.Client, targetName
 	}
 
 	result.total++
-	result.connEvent += result.connEvent
+	result.connEvent += int64(connEvent.Load())
 
 	if err != nil {
 		if isClientTimeout(err) {
-			p.l.Warning("Target:", targetName, ", URL:", req.URL.String(), ", http.doHTTPRequest: timeout error: ", err.Error())
+			p.l.WarningAttrs(err.Error(), slog.String("target", targetName), slog.String("url", req.URL.String()))
 			result.timeouts++
 			return
 		}
-		p.l.Warning("Target:", targetName, ", URL:", req.URL.String(), ", http.doHTTPRequest: ", err.Error())
+		p.l.WarningAttrs(err.Error(), slog.String("target", targetName), slog.String("url", req.URL.String()))
 		return
 	}
 
-	respBody, err := ioutil.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		p.l.Warning("Target:", targetName, ", URL:", req.URL.String(), ", http.doHTTPRequest: ", err.Error())
+		p.l.WarningAttrs(err.Error(), slog.String("target", targetName), slog.String("url", req.URL.String()))
 		return
 	}
 
@@ -367,6 +368,36 @@ func (p *Probe) doHTTPRequest(req *http.Request, client *http.Client, targetName
 	}
 }
 
+func (p *Probe) parseLatencyBreakdown(baseLatencyValue metrics.LatencyValue) *latencyDetails {
+	if len(p.c.GetLatencyBreakdown()) == 0 {
+		return nil
+	}
+	lbMap := make(map[configpb.ProbeConf_LatencyBreakdown]bool)
+	for _, l := range p.c.GetLatencyBreakdown() {
+		lbMap[l] = true
+	}
+
+	all := lbMap[configpb.ProbeConf_ALL_STAGES]
+
+	ld := &latencyDetails{}
+	if all || lbMap[configpb.ProbeConf_DNS_LATENCY] {
+		ld.dnsLatency = baseLatencyValue.Clone().(metrics.LatencyValue)
+	}
+	if all || lbMap[configpb.ProbeConf_CONNECT_LATENCY] {
+		ld.connectLatency = baseLatencyValue.Clone().(metrics.LatencyValue)
+	}
+	if all || lbMap[configpb.ProbeConf_TLS_HANDSHAKE_LATENCY] {
+		ld.tlsLatency = baseLatencyValue.Clone().(metrics.LatencyValue)
+	}
+	if all || lbMap[configpb.ProbeConf_REQ_WRITE_LATENCY] {
+		ld.reqWriteLatency = baseLatencyValue.Clone().(metrics.LatencyValue)
+	}
+	if all || lbMap[configpb.ProbeConf_FIRST_BYTE_LATENCY] {
+		ld.firstByteLatency = baseLatencyValue.Clone().(metrics.LatencyValue)
+	}
+	return ld
+}
+
 func (p *Probe) runProbe(ctx context.Context, target endpoint.Endpoint, clients []*http.Client, req *http.Request, result *probeResult) {
 	reqCtx, cancelReqCtx := context.WithTimeout(ctx, p.opts.Timeout)
 	defer cancelReqCtx()
@@ -397,7 +428,7 @@ func (p *Probe) runProbe(ctx context.Context, target endpoint.Endpoint, clients 
 
 func (p *Probe) newResult() *probeResult {
 	result := &probeResult{
-		respCodes:                    metrics.NewMap("code", metrics.NewInt(0)),
+		respCodes:                    metrics.NewMap("code"),
 		sslEarliestExpirationSeconds: -1,
 	}
 
@@ -406,39 +437,30 @@ func (p *Probe) newResult() *probeResult {
 	}
 
 	if p.opts.LatencyDist != nil {
-		result.latency = p.opts.LatencyDist.Clone()
+		result.latency = p.opts.LatencyDist.CloneDist()
 	} else {
 		result.latency = metrics.NewFloat(0)
 	}
 
+	result.latencyBreakdown = p.parseLatencyBreakdown(result.latency)
+
 	if p.c.GetExportResponseAsMetrics() {
-		result.respBodies = metrics.NewMap("resp", metrics.NewInt(0))
+		result.respBodies = metrics.NewMap("resp")
 	}
 
 	return result
 }
 
 func (p *Probe) exportMetrics(ts time.Time, result *probeResult, target endpoint.Endpoint, dataChan chan *metrics.EventMetrics) {
-	addLabelsAndPublish := func(em *metrics.EventMetrics) {
-		em.AddLabel("ptype", "http").AddLabel("probe", p.name).AddLabel("dst", target.Name)
-		for _, al := range p.opts.AdditionalLabels {
-			em.AddLabel(al.KeyValueForTarget(target))
-		}
-		p.opts.LogMetrics(em)
-		dataChan <- em
-	}
-
 	em := metrics.NewEventMetrics(ts).
 		AddMetric("total", metrics.NewInt(result.total)).
 		AddMetric("success", metrics.NewInt(result.success)).
-		AddMetric(p.opts.LatencyMetricName, result.latency).
+		AddMetric(p.opts.LatencyMetricName, result.latency.Clone()).
 		AddMetric("timeouts", metrics.NewInt(result.timeouts)).
-		AddMetric("resp-code", result.respCodes)
-
-	em.LatencyUnit = p.opts.LatencyUnit
+		AddMetric("resp-code", result.respCodes.Clone())
 
 	if result.respBodies != nil {
-		em.AddMetric("resp-body", result.respBodies)
+		em.AddMetric("resp-body", result.respBodies.Clone())
 	}
 
 	if p.c.GetKeepAlive() {
@@ -449,12 +471,26 @@ func (p *Probe) exportMetrics(ts time.Time, result *probeResult, target endpoint
 		em.AddMetric("validation_failure", result.validationFailure)
 	}
 
-	addLabelsAndPublish(em)
-	for _, ah := range p.opts.AlertHandlers {
-		if err := ah.Record(target, em); err != nil {
-			p.l.Errorf("Error recording EventMetrics for target (%s) with alert handler: %v", target.Name, err)
+	if result.latencyBreakdown != nil {
+		if dl := result.latencyBreakdown.dnsLatency; dl != nil {
+			em.AddMetric("dns_latency", dl.Clone())
+		}
+		if cl := result.latencyBreakdown.connectLatency; cl != nil {
+			em.AddMetric("connect_latency", cl.Clone())
+		}
+		if tl := result.latencyBreakdown.tlsLatency; tl != nil {
+			em.AddMetric("tls_handshake_latency", tl.Clone())
+		}
+		if rwl := result.latencyBreakdown.reqWriteLatency; rwl != nil {
+			em.AddMetric("req_write_latency", rwl.Clone())
+		}
+		if fbl := result.latencyBreakdown.firstByteLatency; fbl != nil {
+			em.AddMetric("first_byte_latency", fbl.Clone())
 		}
 	}
+
+	em.AddLabel("ptype", "http").AddLabel("probe", p.name).AddLabel("dst", target.Name)
+	p.opts.RecordMetrics(target, em, dataChan)
 
 	// SSL earliest cert expiry is exported in an independent EM as it's a
 	// GAUGE metrics.
@@ -462,7 +498,8 @@ func (p *Probe) exportMetrics(ts time.Time, result *probeResult, target endpoint
 		em := metrics.NewEventMetrics(ts).
 			AddMetric("ssl_earliest_cert_expiry_sec", metrics.NewInt(result.sslEarliestExpirationSeconds))
 		em.Kind = metrics.GAUGE
-		addLabelsAndPublish(em)
+		em.AddLabel("ptype", "http").AddLabel("probe", p.name).AddLabel("dst", target.Name)
+		p.opts.RecordMetrics(target, em, dataChan, options.WithNoAlert())
 	}
 }
 
@@ -480,14 +517,19 @@ func (p *Probe) clientsForTarget(target endpoint.Endpoint) []*http.Client {
 		// RoundTripper implementation.
 		if ht, ok := p.baseTransport.(*http.Transport); ok {
 			t := ht.Clone()
-			if p.c.GetProtocol() == configpb.ProbeConf_HTTPS && p.c.GetResolveFirst() {
+
+			// If we're resolving target first, url.Host will be an IP address.
+			// In that case, we need to set ServerName in TLSClientConfig to
+			// the actual hostname.
+			if p.schemeForTarget(target) == "https" && p.resolveFirst(target) {
 				if t.TLSClientConfig == nil {
 					t.TLSClientConfig = &tls.Config{}
 				}
 				if t.TLSClientConfig.ServerName == "" {
-					t.TLSClientConfig.ServerName = urlHostForTarget(target)
+					t.TLSClientConfig.ServerName = hostForTarget(target)
 				}
 			}
+
 			clients[i] = &http.Client{Transport: t}
 		} else {
 			clients[i] = &http.Client{Transport: p.baseTransport}
@@ -516,11 +558,17 @@ func (p *Probe) startForTarget(ctx context.Context, target endpoint.Endpoint, da
 			return
 		}
 
+		if !p.opts.IsScheduled() {
+			continue
+		}
+
 		// If request is nil (most likely because target resolving failed or it
 		// was an invalid target), skip this probe cycle. Note that request
 		// creation gets retried at a regular interval (stats export interval).
 		if req != nil {
 			p.runProbe(ctx, target, clients, req, result)
+		} else {
+			result.total += int64(p.c.GetRequestsPerProbe())
 		}
 
 		// Export stats if it's the time to do so.
@@ -599,8 +647,19 @@ func (p *Probe) updateTargetsAndStartProbes(ctx context.Context, dataChan chan *
 
 		go func(target endpoint.Endpoint, waitTime time.Duration) {
 			defer p.waitGroup.Done()
-			// Wait for wait time + some jitter before starting this probe loop.
-			time.Sleep(waitTime + time.Duration(rand.Int63n(gapBetweenTargets.Microseconds()/10))*time.Microsecond)
+
+			// To evenly spread out target probes, wait for a randomized
+			// duration before starting the target go-routine.
+			if waitTime > 0 {
+				// For random padding using 1/10th of the gap.
+				jitterMaxUsec := gapBetweenTargets.Microseconds() / 10
+				// Make sure we don't pass 0 to rand.Int63n.
+				if jitterMaxUsec <= 0 {
+					jitterMaxUsec = 1
+				}
+				time.Sleep(waitTime + time.Duration(rand.Int63n(jitterMaxUsec))*time.Microsecond)
+			}
+
 			p.startForTarget(probeCtx, target, dataChan)
 		}(target, startWaitTime)
 

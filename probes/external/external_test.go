@@ -1,4 +1,4 @@
-// Copyright 2017-2020 The Cloudprober Authors.
+// Copyright 2017-2024 The Cloudprober Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,15 @@
 package external
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
+	"log"
 	"os"
 	"os/exec"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,119 +33,21 @@ import (
 	"github.com/cloudprober/cloudprober/metrics/testutils"
 	configpb "github.com/cloudprober/cloudprober/probes/external/proto"
 	serverpb "github.com/cloudprober/cloudprober/probes/external/proto"
-	"github.com/cloudprober/cloudprober/probes/external/serverutils"
 	"github.com/cloudprober/cloudprober/probes/options"
 	probeconfigpb "github.com/cloudprober/cloudprober/probes/proto"
 	"github.com/cloudprober/cloudprober/targets"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
-	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/proto"
 )
 
-func isDone(doneChan chan struct{}) bool {
-	// If we are done, return immediately.
-	select {
-	case <-doneChan:
-		return true
-	default:
-	}
-	return false
-}
-
-// startProbeServer starts a test probe server to work with the TestProbeServer
-// test below.
-func startProbeServer(t *testing.T, testPayload string, r io.Reader, w io.WriteCloser, doneChan chan struct{}) {
-	rd := bufio.NewReader(r)
-	for {
-		if isDone(doneChan) {
-			return
-		}
-
-		req, err := serverutils.ReadProbeRequest(rd)
-		if err != nil {
-			// Normal failure because we are finished.
-			if isDone(doneChan) {
-				return
-			}
-			t.Errorf("Error reading probe request. Err: %v", err)
-			return
-		}
-		var action, target string
-		opts := req.GetOptions()
-		for _, opt := range opts {
-			if opt.GetName() == "action" {
-				action = opt.GetValue()
-				continue
-			}
-			if opt.GetName() == "target" {
-				target = opt.GetValue()
-				continue
-			}
-		}
-		id := req.GetRequestId()
-
-		actionToResponse := map[string]*serverpb.ProbeReply{
-			"nopayload": {RequestId: proto.Int32(id)},
-			"payload": {
-				RequestId: proto.Int32(id),
-				Payload:   proto.String(testPayload),
-			},
-			"payload_with_error": {
-				RequestId:    proto.Int32(id),
-				Payload:      proto.String(testPayload),
-				ErrorMessage: proto.String("error"),
-			},
-		}
-		t.Logf("Request id: %d, action: %s, target: %s", id, action, target)
-		if action == "pipe_server_close" {
-			w.Close()
-			return
-		}
-		if res, ok := actionToResponse[action]; ok {
-			serverutils.WriteMessage(res, w)
-		}
-	}
-}
+var pidsFile string
 
 func setProbeOptions(p *Probe, name, value string) {
 	for _, opt := range p.c.Options {
 		if opt.GetName() == name {
 			opt.Value = proto.String(value)
 			break
-		}
-	}
-}
-
-// runAndVerifyServerProbe executes a server probe and verifies the replies
-// received.
-func runAndVerifyServerProbe(t *testing.T, p *Probe, action string, tgts []string, total, success map[string]int64, numEventMetrics int) {
-	setProbeOptions(p, "action", action)
-
-	runAndVerifyProbe(t, p, tgts, total, success)
-
-	// Verify that we got all the expected EventMetrics
-	ems, err := testutils.MetricsFromChannel(p.dataChan, numEventMetrics, 1*time.Second)
-	if err != nil {
-		t.Error(err)
-	}
-	metricsMap := testutils.MetricsMap(ems)
-
-	// Convenient wrapper to get the last value from a series.
-	lastValue := func(s []*metrics.EventMetrics, metricName string) int64 {
-		return s[len(s)-1].Metric(metricName).(metrics.NumValue).Int64()
-	}
-
-	for _, tgt := range tgts {
-		vals := make(map[string]int64)
-		for _, m := range []string{"total", "success"} {
-			s := metricsMap[m][tgt]
-			if len(s) == 0 {
-				t.Errorf("No %s metric for target: %s", m, tgt)
-				continue
-			}
-			vals[m] = lastValue(s, m)
-		}
-		if vals["success"] != success[tgt] || vals["total"] != total[tgt] {
-			t.Errorf("Target(%s) total=%d, success=%d, wanted: total=%d, success=%d, all_metrics=%s", tgt, vals["total"], vals["success"], total[tgt], success[tgt], ems)
 		}
 	}
 }
@@ -157,30 +59,23 @@ func runAndVerifyProbe(t *testing.T, p *Probe, tgts []string, total, success map
 	p.runProbe(context.Background())
 
 	for _, target := range p.targets {
-		tgt := target.Name
+		tgtKey := target.Key()
 
-		if p.results[tgt].total != total[tgt] {
-			t.Errorf("p.total[%s]=%d, Want: %d", tgt, p.results[tgt].total, total[tgt])
-		}
-		if p.results[tgt].success != success[tgt] {
-			t.Errorf("p.success[%s]=%d, Want: %d", tgt, p.results[tgt].success, success[tgt])
-		}
+		assert.Equal(t, total[target.Name], p.results[tgtKey].total, "total")
+		assert.Equal(t, success[target.Name], p.results[tgtKey].success, "success")
 	}
 }
 
-func createTestProbe(cmd string) *Probe {
+func createTestProbe(cmd string, envVar map[string]string) *Probe {
 	probeConf := &configpb.ProbeConf{
 		Options: []*configpb.ProbeConf_Option{
-			{
-				Name:  proto.String("target"),
-				Value: proto.String("@target@"),
-			},
 			{
 				Name:  proto.String("action"),
 				Value: proto.String(""),
 			},
 		},
 		Command: &cmd,
+		EnvVar:  envVar,
 	}
 
 	p := &Probe{
@@ -197,220 +92,167 @@ func createTestProbe(cmd string) *Probe {
 	return p
 }
 
-func testProbeServerSetup(t *testing.T, readErrorCh chan error) (*Probe, string, chan struct{}) {
-	// We create two pairs of pipes to establish communication between this prober
-	// and the test probe server (defined above).
-	// Test probe server input pipe. We writes on w1 and external command reads
-	// from r1.
-	r1, w1, err := os.Pipe()
-	if err != nil {
-		t.Errorf("Error creating OS pipe. Err: %v", err)
-	}
-	// Test probe server output pipe. External command writes on w2 and we read
-	// from r2.
-	r2, w2, err := os.Pipe()
-	if err != nil {
-		t.Errorf("Error creating OS pipe. Err: %v", err)
+// TestShellProcessSuccess is just a helper function that we use to test the
+// actual command execution (from startCmdIfNotRunning, e.g.).
+func TestShellProcessSuccess(t *testing.T) {
+	// Ignore this test if it's not being run as a subprocess for another test.
+	if os.Getenv("GO_CP_TEST_PROCESS") != "1" {
+		return
 	}
 
-	testPayload := "p90 45\n"
-	// Start probe server in a goroutine
-	doneChan := make(chan struct{})
-	go startProbeServer(t, testPayload, r1, w2, doneChan)
-
-	p := createTestProbe("./testCommand")
-	p.cmdRunning = true // don't try to start the probe server
-	p.cmdStdin = w1
-	p.cmdStdout = r2
-	p.mode = "server"
-
-	// Start the goroutine that reads probe replies.
-	go func() {
-		err := p.readProbeReplies(doneChan)
-		if readErrorCh != nil {
-			readErrorCh <- err
-			close(readErrorCh)
+	exportEnvList := []string{}
+	for _, env := range os.Environ() {
+		if strings.HasPrefix(env, "GO_CP_TEST") {
+			exportEnvList = append(exportEnvList, env)
 		}
-	}()
+	}
+	fmt.Fprintf(os.Stderr, "Running test command. Env: %s\n", strings.Join(exportEnvList, ","))
 
-	return p, testPayload, doneChan
+	if len(os.Args) > 4 {
+		fmt.Printf("cmd \"%s\"\n", os.Args[3])
+		time.Sleep(10 * time.Millisecond)
+		fmt.Printf("args \"%s\"\n", strings.Join(os.Args[4:], ","))
+		fmt.Printf("env \"%s\"\n", strings.Join(exportEnvList, ","))
+	}
+
+	if os.Getenv("GO_CP_TEST_PROCESS_FAIL") != "" {
+		os.Exit(1)
+	}
+
+	pauseSec, err := strconv.Atoi(os.Getenv("GO_CP_TEST_PAUSE"))
+	if err != nil {
+		pauseSec = 0
+	}
+	if pauseSec != 0 {
+		fmt.Fprintf(os.Stderr, "Going to sleep for %d\n", pauseSec)
+		time.Sleep(time.Duration(pauseSec) * time.Second)
+	}
+	os.Exit(0)
 }
 
-func TestProbeServerMode(t *testing.T) {
-	p, _, doneChan := testProbeServerSetup(t, nil)
-	defer close(doneChan)
+func testProbeOnceMode(t *testing.T, cmd string, tgts []string, runTwice, disableStreaming bool, wantCmd string, wantArgs []string) {
+	t.Helper()
+
+	p := createTestProbe(cmd, map[string]string{
+		"GO_CP_TEST_PROCESS":   "1",
+		"GO_CP_TEST_PIDS_FILE": pidsFile,
+	})
+
+	p.cmdArgs = append([]string{"-test.run=TestShellProcessSuccess", "--", p.cmdName}, p.cmdArgs...)
+	p.cmdName = os.Args[0]
+	p.mode = "once"
+	p.c.DisableStreamingOutputMetrics = proto.Bool(disableStreaming)
+	// We don't rely on timeout but give process enough time to finish,
+	// especially for CI.
+	p.opts.Timeout = 10 * time.Second
 
 	total, success := make(map[string]int64), make(map[string]int64)
-
-	// No payload
-	tgts := []string{"target1", "target2"}
 	for _, tgt := range tgts {
 		total[tgt]++
 		success[tgt]++
 	}
-	t.Run("nopayload", func(t *testing.T) {
-		runAndVerifyServerProbe(t, p, "nopayload", tgts, total, success, 2)
+
+	var standardEMCount, outputEMCount int
+	numOutVars := 3
+
+	t.Run("first-run", func(t *testing.T) {
+		standardEMCount += len(tgts)            // 1 EM for each target
+		outputEMCount += numOutVars * len(tgts) // 3 EMs for each target
+		runAndVerifyProbe(t, p, tgts, total, success)
 	})
 
-	// Payload
-	tgts = []string{"target3"}
-	for _, tgt := range tgts {
-		total[tgt]++
-		success[tgt]++
-	}
-	t.Run("payload", func(t *testing.T) {
-		// 2 metrics per target
-		runAndVerifyServerProbe(t, p, "payload", tgts, total, success, 1*2)
-	})
+	if runTwice {
+		t.Run("second-run", func(t *testing.T) {
+			// Cause our test command to fail immediately
+			os.Setenv("GO_CP_TEST_PROCESS_FAIL", "1")
+			defer os.Unsetenv("GO_CP_TEST_PROCESS_FAIL")
 
-	// Payload with error
-	tgts = []string{"target2", "target3"}
-	for _, tgt := range tgts {
-		total[tgt]++
-	}
-	t.Run("payload_with_error", func(t *testing.T) {
-		// 2 targets, 2 EMs per target
-		runAndVerifyServerProbe(t, p, "payload_with_error", tgts, total, success, 2*2)
-	})
-
-	// Timeout
-	tgts = []string{"target1", "target2", "target3"}
-	for _, tgt := range tgts {
-		total[tgt]++
+			standardEMCount += len(tgts)            // 1 EM for each target
+			outputEMCount += numOutVars * len(tgts) // 3 EMs for each target
+			for _, tgt := range tgts {
+				total[tgt]++
+			}
+			runAndVerifyProbe(t, p, tgts, total, success)
+		})
 	}
 
-	// Reduce probe timeout to make this test pass quicker.
-	p.opts.Timeout = time.Second
-	t.Run("timeout", func(t *testing.T) {
-		// 3 targets, 1 EM per target
-		runAndVerifyServerProbe(t, p, "timeout", tgts, total, success, 3*1)
-	})
-}
+	ems, err := testutils.MetricsFromChannel(p.dataChan, standardEMCount+outputEMCount, time.Second)
+	if err != nil {
+		t.Error(err)
+	}
 
-func TestProbeServerRemotePipeClose(t *testing.T) {
-	readErrorCh := make(chan error)
-	p, _, doneChan := testProbeServerSetup(t, readErrorCh)
-	defer close(doneChan)
+	mmap := testutils.MetricsMapByTarget(ems)
+	emMap := testutils.EventMetricsByTargetMetric(ems)
 
-	total, success := make(map[string]int64), make(map[string]int64)
-	// Remote pipe close
-	tgts := []string{"target"}
-	for _, tgt := range tgts {
-		total[tgt]++
-	}
-	// Reduce probe timeout to make this test pass quicker.
-	p.opts.Timeout = time.Second
-	runAndVerifyServerProbe(t, p, "pipe_server_close", tgts, total, success, 1)
-	readError := <-readErrorCh
-	if readError == nil {
-		t.Error("Didn't get error in reading pipe")
-	}
-	if readError != io.EOF {
-		t.Errorf("Didn't get correct error in reading pipe. Got: %v, wanted: %v", readError, io.EOF)
-	}
-}
+	for i, tgt := range tgts {
+		// Verify number of values received for each metric
+		for names, wantCount := range map[[3]string]int{
+			{"total", "success", "latency"}: standardEMCount / len(tgts),
+			{"cmd", "args", "env"}:          outputEMCount / (len(tgts) * numOutVars),
+		} {
+			for _, name := range names {
+				assert.Lenf(t, mmap[tgt][name], wantCount, "Wrong number of values for metric (%s) for target (%s)", name, tgt)
+			}
+		}
 
-func TestProbeServerLocalPipeClose(t *testing.T) {
-	readErrorCh := make(chan error)
-	p, _, doneChan := testProbeServerSetup(t, readErrorCh)
-	defer close(doneChan)
+		wantEnv := [][]string{{"GO_CP_TEST_PROCESS=1"}, {"GO_CP_TEST_PROCESS_FAIL=1", "GO_CP_TEST_PROCESS=1"}}
 
-	total, success := make(map[string]int64), make(map[string]int64)
-	// Local pipe close
-	tgts := []string{"target"}
-	for _, tgt := range tgts {
-		total[tgt]++
-	}
-	// Reduce probe timeout to make this test pass quicker.
-	p.opts.Timeout = time.Second
-	p.cmdStdout.(*os.File).Close()
-	runAndVerifyServerProbe(t, p, "pipe_local_close", tgts, total, success, 1)
-	readError := <-readErrorCh
-	if readError == nil {
-		t.Error("Didn't get error in reading pipe")
-	}
-	if _, ok := readError.(*os.PathError); !ok {
-		t.Errorf("Didn't get correct error in reading pipe. Got: %T, wanted: *os.PathError", readError)
+		// Verify values for each output metric
+		for j := range mmap[tgt]["args"] {
+			assert.Equalf(t, "\""+wantArgs[i]+"\"", mmap[tgt]["args"][j].String(), "Wrong value for args[%d] metric for target (%s)", j, tgt)
+			assert.Equalf(t, "\""+wantCmd+"\"", mmap[tgt]["cmd"][j].String(), "Wrong value for cmd[%d] metric for target (%s)", j, tgt)
+
+			for _, e := range wantEnv[j] {
+				assert.Contains(t, mmap[tgt]["env"][j].String(), e, "env[%d] metric for target (%s) doesn't contain expected value", j, tgt)
+			}
+		}
+
+		cmdTime := emMap[tgt]["cmd"][0].Timestamp
+		argsTime := emMap[tgt]["args"][0].Timestamp
+		if disableStreaming {
+			assert.Equal(t, cmdTime, argsTime, "cmd and args metrics should have same timestamp")
+		} else {
+			assert.True(t, cmdTime.Before(argsTime), "cmd metric should have earlier timestamp than args metric")
+		}
 	}
 }
 
 func TestProbeOnceMode(t *testing.T) {
-	testCmd := "/test/cmd --arg1 --arg2"
-
-	p := createTestProbe(testCmd)
-	p.mode = "once"
-	tgts := []string{"target1", "target2"}
-
-	// Set runCommand to a function that runs successfully and returns a pyload.
-	p.runCommandFunc = func(ctx context.Context, cmd string, cmdArgs []string) ([]byte, []byte, error) {
-		var resp []string
-		resp = append(resp, fmt.Sprintf("cmd \"%s\"", cmd))
-		resp = append(resp, fmt.Sprintf("num-args %d", len(cmdArgs)))
-		return []byte(strings.Join(resp, "\n")), nil, nil
+	var tests = []struct {
+		name             string
+		cmd              string
+		tgts             []string
+		runTwice         bool
+		disableStreaming bool
+		wantArgs         []string
+	}{
+		{
+			name:     "no-substitutions",
+			cmd:      "/test/cmd --address=a.com --arg2",
+			tgts:     []string{"target1", "target2"},
+			runTwice: true,
+			wantArgs: []string{"--address=a.com,--arg2", "--address=a.com,--arg2"},
+		},
+		{
+			name:     "arg-substitutions",
+			cmd:      "/test/cmd --address=@target@ --arg2",
+			tgts:     []string{"target1", "target2"},
+			wantArgs: []string{"--address=target1,--arg2", "--address=target2,--arg2"},
+		},
+		{
+			name:             "streaming-disabled",
+			cmd:              "/test/cmd --address=a.com --arg2",
+			tgts:             []string{"target1", "target2"},
+			disableStreaming: true,
+			wantArgs:         []string{"--address=a.com,--arg2", "--address=a.com,--arg2"},
+		},
 	}
 
-	total, success := make(map[string]int64), make(map[string]int64)
-
-	for _, tgt := range tgts {
-		total[tgt]++
-		success[tgt]++
-	}
-
-	runAndVerifyProbe(t, p, tgts, total, success)
-
-	// Try with failing command now
-	p.runCommandFunc = func(ctx context.Context, cmd string, cmdArgs []string) ([]byte, []byte, error) {
-		return nil, nil, fmt.Errorf("error executing %s", cmd)
-	}
-
-	for _, tgt := range tgts {
-		total[tgt]++
-	}
-	runAndVerifyProbe(t, p, tgts, total, success)
-
-	// Total numbder of event metrics:
-	// num_of_runs x num_targets x (1 for default metrics + 1 for payload metrics)
-	ems, err := testutils.MetricsFromChannel(p.dataChan, 8, time.Second)
-	if err != nil {
-		t.Error(err)
-	}
-	metricsMap := testutils.MetricsMap(ems)
-
-	if metricsMap["num-args"] == nil && metricsMap["cmd"] == nil {
-		t.Errorf("Didn't get all metrics from the external process output.")
-	}
-
-	if metricsMap["total"] == nil && metricsMap["success"] == nil {
-		t.Errorf("Didn't get default metrics from the probe run.")
-	}
-
-	for _, tgt := range tgts {
-		// Verify that default metrics were received for both runs -- success and
-		// failure. We don't check for the values here as that's already done by
-		// runAndVerifyProbe to an extent.
-		for _, m := range []string{"total", "success", "latency"} {
-			if len(metricsMap[m][tgt]) != 2 {
-				t.Errorf("Wrong number of values for default metric (%s) for target (%s). Got=%d, Expected=2", m, tgt, len(metricsMap[m][tgt]))
-			}
-		}
-
-		for _, m := range []string{"num-args", "cmd"} {
-			if len(metricsMap[m][tgt]) != 1 {
-				t.Errorf("Wrong number of values for metric (%s) for target (%s) from the command output. Got=%d, Expected=1", m, tgt, len(metricsMap[m][tgt]))
-			}
-		}
-
-		tgtNumArgs := metricsMap["num-args"][tgt][0].Metric("num-args").(metrics.NumValue).Int64()
-		expectedNumArgs := int64(len(strings.Split(testCmd, " ")) - 1)
-		if tgtNumArgs != expectedNumArgs {
-			t.Errorf("Wrong metric value for target (%s) from the command output. Got=%d, Expected=%d", tgt, tgtNumArgs, expectedNumArgs)
-		}
-
-		tgtCmd := metricsMap["cmd"][tgt][0].Metric("cmd").String()
-		expectedCmd := fmt.Sprintf("\"%s\"", strings.Split(testCmd, " ")[0])
-		if tgtCmd != expectedCmd {
-			t.Errorf("Wrong metric value for target (%s) from the command output. got=%s, expected=%s", tgt, tgtCmd, expectedCmd)
-		}
+	for _, tt := range tests {
+		wantCmd := "/test/cmd"
+		t.Run(tt.name, func(t *testing.T) {
+			testProbeOnceMode(t, tt.cmd, tt.tgts, tt.runTwice, tt.disableStreaming, wantCmd, tt.wantArgs)
+		})
 	}
 }
 
@@ -461,112 +303,6 @@ func TestUpdateLabelKeys(t *testing.T) {
 	}
 	if !reflect.DeepEqual(gotLabels, wantLabels) {
 		t.Errorf("p.labels got: %v, want: %v", gotLabels, wantLabels)
-	}
-}
-
-func TestSubstituteLabels(t *testing.T) {
-	tests := []struct {
-		desc   string
-		in     string
-		labels map[string]string
-		want   string
-		found  bool
-	}{
-		{
-			desc:  "No replacement",
-			in:    "foo bar baz",
-			want:  "foo bar baz",
-			found: true,
-		},
-		{
-			desc: "Replacement beginning",
-			in:   "@foo@ bar baz",
-			labels: map[string]string{
-				"foo": "h e llo",
-			},
-			want:  "h e llo bar baz",
-			found: true,
-		},
-		{
-			desc: "Replacement middle",
-			in:   "beginning @😿@ end",
-			labels: map[string]string{
-				"😿": "😺",
-			},
-			want:  "beginning 😺 end",
-			found: true,
-		},
-		{
-			desc: "Replacement end",
-			in:   "bar baz @foo@",
-			labels: map[string]string{
-				"foo": "XöX",
-				"bar": "nope",
-			},
-			want:  "bar baz XöX",
-			found: true,
-		},
-		{
-			desc: "Replacements",
-			in:   "abc@foo@def@foo@ jk",
-			labels: map[string]string{
-				"def": "nope",
-				"foo": "XöX",
-			},
-			want:  "abcXöXdefXöX jk",
-			found: true,
-		},
-		{
-			desc: "Multiple labels",
-			in:   "xx @foo@@bar@ yy",
-			labels: map[string]string{
-				"bar": "_",
-				"def": "nope",
-				"foo": "XöX",
-			},
-			want:  "xx XöX_ yy",
-			found: true,
-		},
-		{
-			desc: "Not found",
-			in:   "A b C @d@ e",
-			labels: map[string]string{
-				"bar": "_",
-				"def": "nope",
-				"foo": "XöX",
-			},
-			want: "A b C @d@ e",
-		},
-		{
-			desc: "@@",
-			in:   "hello@@foo",
-			labels: map[string]string{
-				"bar": "_",
-				"def": "nope",
-				"foo": "XöX",
-			},
-			want:  "hello@foo",
-			found: true,
-		},
-		{
-			desc: "odd number",
-			in:   "hello@foo@bar@xx",
-			labels: map[string]string{
-				"foo": "yy",
-			},
-			want:  "helloyybar@xx",
-			found: true,
-		},
-	}
-
-	for _, tc := range tests {
-		got, found := substituteLabels(tc.in, tc.labels)
-		if tc.found != found {
-			t.Errorf("%v: substituteLabels(%q, %q) = _, %v, want %v", tc.desc, tc.in, tc.labels, found, tc.found)
-		}
-		if tc.want != got {
-			t.Errorf("%v: substituteLabels(%q, %q) = %q, _, want %q", tc.desc, tc.in, tc.labels, got, tc.want)
-		}
 	}
 }
 
@@ -634,16 +370,17 @@ func TestUpdateTargets(t *testing.T) {
 	}
 
 	p.updateTargets()
-	latVal := p.results["2.2.2.2"].latency
+	ep := endpoint.Endpoint{Name: "2.2.2.2"}
+	latVal := p.results[ep.Key()].latency
 	if _, ok := latVal.(*metrics.Float); !ok {
 		t.Errorf("latency value type is not metrics.Float: %v", latVal)
 	}
 
 	// Test with latency distribution option set.
 	p.opts.LatencyDist = metrics.NewDistribution([]float64{0.1, 0.2, 0.5})
-	delete(p.results, "2.2.2.2")
+	delete(p.results, ep.Key())
 	p.updateTargets()
-	latVal = p.results["2.2.2.2"].latency
+	latVal = p.results[ep.Key()].latency
 	if _, ok := latVal.(*metrics.Distribution); !ok {
 		t.Errorf("latency value type is not metrics.Distribution: %v", latVal)
 	}
@@ -660,31 +397,28 @@ func verifyProcessedResult(t *testing.T, p *Probe, r *result, success int64, nam
 	}
 
 	// Get 2 EventMetrics = default metrics, and payload metrics.
-	m, err := testutils.MetricsFromChannel(p.dataChan, 2, time.Second)
+	ems, err := testutils.MetricsFromChannel(p.dataChan, 2, time.Second)
 	if err != nil {
 		t.Fatal(err.Error())
 	}
 
-	metricsMap := testutils.MetricsMap(m)
+	mmap, lmap := testutils.MetricsMapByTarget(ems), testutils.LabelsMapByTarget(ems)
 
-	if metricsMap[name] == nil || len(metricsMap[name][testTarget]) < 1 {
-		t.Fatalf("Payload metric %s is missing in %+v", name, metricsMap)
+	if mmap[testTarget] == nil || lmap[testTarget] == nil {
+		t.Fatalf("Payload metrics for target %s missing", testTarget)
 	}
 
-	em := metricsMap[name][testTarget][0]
-	gotValue := em.Metric(name).(metrics.NumValue).Int64()
-	if gotValue != val {
-		t.Errorf("%s=%d, expected=%d", name, gotValue, val)
+	if len(mmap[testTarget][name]) < 1 {
+		t.Fatalf("Payload metric %s is missing in %+v", name, mmap[testTarget])
 	}
+
+	assert.Equal(t, val, mmap[testTarget][name][0].(metrics.NumValue).Int64(), "metric %s value mismatch", name)
 
 	expectedLabels := map[string]string{"ptype": "external", "probe": "testprobe", "dst": "test-target"}
 	for k, v := range extraLabels {
 		expectedLabels[k] = v
 	}
-
-	if len(em.LabelsKeys()) != len(expectedLabels) {
-		t.Errorf("Labels mismatch: got=%v, expected=%v", em.LabelsKeys(), expectedLabels)
-	}
+	assert.Equal(t, expectedLabels, lmap[testTarget], "labels mismatch")
 }
 
 func TestProcessProbeResult(t *testing.T) {
@@ -774,7 +508,7 @@ func TestProcessProbeResult(t *testing.T) {
 
 			// First run
 			p.processProbeResult(&probeStatus{
-				target:  "test-target",
+				target:  endpoint.Endpoint{Name: "test-target"},
 				success: true,
 				latency: time.Millisecond,
 				payload: test.payloads[0],
@@ -785,7 +519,7 @@ func TestProcessProbeResult(t *testing.T) {
 
 			// Second run
 			p.processProbeResult(&probeStatus{
-				target:  "test-target",
+				target:  endpoint.Endpoint{Name: "test-target"},
 				success: true,
 				latency: time.Millisecond,
 				payload: test.payloads[1],
@@ -798,7 +532,7 @@ func TestProcessProbeResult(t *testing.T) {
 }
 
 func TestCommandParsing(t *testing.T) {
-	p := createTestProbe("./test-command --flag1 one --flag23 \"two three\"")
+	p := createTestProbe("./test-command --flag1 one --flag23 \"two three\"", nil)
 
 	wantCmdName := "./test-command"
 	if p.cmdName != wantCmdName {
@@ -898,4 +632,116 @@ func TestMonitorCommand(t *testing.T) {
 			startCancelFunc()
 		})
 	}
+}
+
+func TestProbeStartCmdIfNotRunning(t *testing.T) {
+	isCmdRunning := func(p *Probe) bool {
+		p.cmdRunningMu.Lock()
+		defer p.cmdRunningMu.Unlock()
+		return p.cmdRunning
+	}
+
+	waitForCmdToEnd := func(p *Probe) {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		for {
+			select {
+			case <-ctx.Done():
+				t.Fatal("Timed out waiting for command to finish")
+			default:
+			}
+			if !isCmdRunning(p) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	tests := []struct {
+		pauseSec int
+		wantErr  bool
+	}{
+		{
+			pauseSec: 0,
+		},
+		{
+			pauseSec: 10,
+		},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("pause=%d", test.pauseSec), func(t *testing.T) {
+			// testCommand is just a placeholder here. We replace cmdName and
+			// cmdArgs after creating the probe.
+			p := createTestProbe("/testCommand", map[string]string{
+				"GO_CP_TEST_PROCESS": "1",
+				"GO_CP_TEST_PAUSE":   strconv.Itoa(test.pauseSec),
+			})
+
+			p.cmdName = os.Args[0]
+			p.cmdArgs = []string{"-test.run=TestShellProcessSuccess"}
+
+			if err := p.startCmdIfNotRunning(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			stdin, stdout, stderr := p.cmdStdin, p.cmdStdout, p.cmdStderr
+			// Wait for the command to finish if it's not supposed to wait
+			if test.pauseSec == 0 {
+				waitForCmdToEnd(p)
+			}
+
+			if err := p.startCmdIfNotRunning(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+
+			// if original process has died, i.e pauseSec == 0, stdin, stdout,
+			// and stdout should be different now as new process will have started.
+			changedOrNot := test.pauseSec == 0
+			assert.Equal(t, changedOrNot, stdin != p.cmdStdin)
+			assert.Equal(t, changedOrNot, stdout != p.cmdStdout)
+			assert.Equal(t, changedOrNot, stderr != p.cmdStderr)
+		})
+	}
+}
+
+func TestMain(m *testing.M) {
+	// In the main process, create temp file to store pids of the forked
+	// processes.
+	if os.Getenv("GO_CP_TEST_PROCESS") == "" {
+		tempFile, err := os.CreateTemp("", "cloudprober-external-test-pids")
+		if err != nil {
+			log.Fatalf("Failed to create temp file for pids: %v", err)
+		}
+		pidsFile = tempFile.Name()
+		tempFile.Close()
+	} else {
+		pidsF, err := os.OpenFile(os.Getenv("GO_CP_TEST_PIDS_FILE"), os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			log.Fatalf("Failed to open temp file for pids: %v", err)
+		}
+		pidsF.WriteString(fmt.Sprintf("%d\n", os.Getpid()))
+		pidsF.Close()
+	}
+
+	status := m.Run()
+
+	// Read pid from pidsFile
+	pidsBytes, err := os.ReadFile(pidsFile)
+	if err != nil {
+		log.Fatalf("Failed to open temp file for pids: %v", err)
+	}
+	for _, pid := range strings.Fields(strings.TrimSpace(string(pidsBytes))) {
+		pid, err := strconv.Atoi(pid)
+		if err != nil {
+			log.Fatalf("Failed to convert pid (%v) to int, err: %v", pid, err)
+		}
+		log.Println("Killing pid", pid)
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			continue
+		}
+		p.Kill()
+	}
+
+	os.Exit(status)
 }

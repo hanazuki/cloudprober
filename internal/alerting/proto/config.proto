@@ -1,0 +1,216 @@
+syntax = "proto3";
+
+package cloudprober.alerting;
+
+option go_package = "github.com/cloudprober/cloudprober/internal/alerting/proto";
+
+import "github.com/cloudprober/cloudprober/internal/httpreq/proto/config.proto";
+
+
+message Email {
+    // Email addresses to send the alert to.
+    repeated string to = 1;
+
+    // From address in the alert email.
+    // If not set, defaults to the value of smtp_user if smtp_user is set,
+    // otherwise defaults to cloudprober-alert@<hostname>.
+    string from = 2;
+
+    // Default: Environment variable SMTP_SERVER 
+    string smtp_server = 3;  
+
+    // Default: Environment variable SMTP_USERNAME
+    string smtp_username = 4;  
+
+    // Default: Environment variable SMTP_PASSWORD
+    string smtp_password = 5;  
+}
+
+message Opsgenie {
+    // API key to access Opsgenie. It's usually tied to a team and is
+    // obtained by creating a new API integration or using an existing one.
+    string api_key = 1;
+
+    // Environment variable name Default: OPSGENIE_API_KEY
+    string api_key_env_var = 2; 
+
+    message Responder {
+        oneof ref {
+            string id = 1;
+            string name = 2;
+        }
+        enum Type {
+            UNKNOWN_RESPONDER = 0;
+            USER = 1;
+            TEAM = 2;
+            ESCALATION = 3;
+            SCHEDULE = 4;
+        }
+        Type type = 3; 
+    }
+
+    // Opsgenie responders. Opsgenie uses the responders to route the alerts if
+    // API key doesn't belong to a team integration.
+    // Example:
+    //  responders {
+    //    id: "4513b7ea-3b91-438f-b7e4-e3e54af9147c"
+    //    type: TEAM
+    //  }
+    repeated Responder responders = 3;
+
+    // Opsgenie API URL.
+    // Default: https://api.opsgenie.com/v2/alerts
+    string api_url = 4;
+
+    // Whether to send resolve notifications or not. Default is to send resolve
+    // notifications.
+    bool disable_send_resolved = 5; // Default: false
+
+}
+
+message PagerDuty {
+    // PagerDuty Routing Key.
+    // The routing key is used to authenticate to PagerDuty and is tied to a
+    // service. You can obtain the routing key from the service page, under the
+    // integrations tab.
+    // Note: set either routing_key or routing_key_env_var. routing_key
+    // takes precedence over routing_key_env_var.
+    string routing_key = 1;
+
+    // The environment variable containing the pagerduty routing key.
+    // Default: PAGERDUTY_ROUTING_KEY;
+    string routing_key_env_var = 2;
+
+    // PagerDuty API URL.
+    // Used to overwrite the default PagerDuty API URL.
+    string api_url = 3; // Default: https://event.pagerduty.com
+
+    // Whether to send resolve notifications or not. Default is to send resolve
+    // notifications.
+    bool disable_send_resolved = 4; // Default: false
+}
+
+message Slack {
+    // Webhook URL
+    // The Slack notifications use a webhook URL to send the notifications to
+    // a Slack channel. The webhook URL can be found in the Slack console under
+    // the "Incoming Webhooks" section.
+    // https://api.slack.com/messaging/webhooks
+    // Note: set either webhook_url or webhook_url_env_var. webhook_url
+    // takes precedence over webhook_url_env_var.
+    string webhook_url = 1;
+
+    // The environment variable that is used to contain the slack webhook URL.
+    string webhook_url_env_var = 2; // Default: SLACK_WEBHOOK_URL;
+}
+
+message NotifyConfig {
+    // Command to run when alert is fired. You can use this command to do
+    // various things, e.g.:
+    //  - Send a notification using a method not supported by Cloudprober.
+    //  - Collect more information, e.g. send mtr report on ping failures.
+    //  - Attempt fix the issue, e.g. restart a pod or clear cache.
+    //
+    // In the command line following fields are substituted:
+    //  @alert@: Alert name
+    //  @probe@: Probe name
+    //  @target@: Target name, or target and port if port is specified.
+    //  @target.label.<label>@: Label <label> value, e.g. target.label.role.
+    //  @failures@: Count of failures.
+    //  @total@: Out of.
+    //  @since@: Time since the alert condition started.
+    //  @json@: JSON representation of the alert fields.
+    //
+    // For example, if you want to send an email when an alert is fired, you can
+    // use the following command:
+    // command: "/usr/bin/mail -s 'Alert @alert@ fired for @target@' manu@a.b"
+    string command = 10;
+
+    // Email notification configuration.
+    Email email = 11;
+
+    // PagerDuty configuration.
+    PagerDuty pager_duty = 12;
+
+    // Slack configuration.
+    Slack slack = 13;
+
+    // Opsgenie configuration.
+    Opsgenie opsgenie = 14;
+
+    // Notify using an HTTP request. HTTP request fields are expanded using the
+    // same template expansion rules as "command" above:
+    // For example, to send a notification using rest API:
+    //  http_notify {
+    //    url: "http://localhost:8080/alert"
+    //    method: POST
+    //    header {
+    //      key: "Authorization"
+    //      value: "Bearer {{env 'AUTH_TOKEN'}}"
+    //    }
+    //    data: "{\"message\": \"@alert@ fired for @target@\", \"details\": \"name\"}"
+    //  }
+    utils.httpreq.HTTPRequest http_notify = 3;
+}
+
+message Condition {
+    int32 failures = 1;
+    int32 total = 2;
+}
+
+message AlertConf {
+    // Name of the alert. Default is to use the probe name. If you have multiple
+    // alerts for the same probe, you must specify a name for each alert.
+    string name = 1;
+
+    // Condition for the alert. Default is to alert on any failure.
+    // Example:
+    // # Alert if 6 out of 10 probes fail.
+    // condition {
+    //   failures: 6
+    //   total: 10
+    // }
+    optional Condition condition = 2;
+
+    // How to notify in case of alert.
+    NotifyConfig notify = 3;
+
+    // Dashboard URL template.
+    // Default: http://localhost:9313/status?probe=@probe@
+    string dashboard_url_template = 4;  // Default: ""
+    
+    string playbook_url_template = 5;  // Default: ""
+
+    // Default: Cloudprober alert "@alert@" for "@target@"
+    string summary_template = 6;
+
+    // Default:
+    // Cloudprober alert "@alert@" for "@target@":
+    // Failures: @failures@ out of @total@ probes
+    // Failing since: @since@
+    // Probe: @probe@
+    // Dashboard: @dashboard_url@
+    // Playbook: @playbook_url@
+    string details_template = 7;  // Default: ""
+
+    // Key values to be included in the alert. These fields are expanded
+    // using the same template expansion rules as summary_template and
+    // details_template (see above).
+    map<string, string> other_info = 9;
+
+    // Severity of the alert. If provided it's included in the alert
+    // notifications. If severity is not defined, we set it to ERROR for
+    // PagerDuty notifications.
+    enum Severity {
+        UNKNOWN_SEVERITY = 0;
+        CRITICAL = 1;
+        ERROR = 2;
+        WARNING = 3;
+        INFO = 4;
+    }
+    Severity severity = 10;
+
+    // How often to repeat notification for the same alert. Default is 1hr.
+    // To disable any kind of notification throttling, set this to 0.
+    optional int32 repeat_interval_sec = 8;  // Default: 1hr
+}

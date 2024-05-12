@@ -19,12 +19,14 @@ package endpoint
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/cloudprober/cloudprober/common/iputils"
+	targetspb "github.com/cloudprober/cloudprober/targets/proto"
 )
 
 // Endpoint represents a targets and associated parameters.
@@ -47,7 +49,11 @@ func (ep *Endpoint) Key() string {
 	}
 	sort.Strings(labelSlice)
 
-	return strings.Join(append([]string{ep.Name, strconv.Itoa(ep.Port)}, labelSlice...), "_")
+	ip := ""
+	if ep.IP != nil {
+		ip = ep.IP.String()
+	}
+	return strings.Join(append([]string{ep.Name, ip, strconv.Itoa(ep.Port)}, labelSlice...), "_")
 }
 
 // Lister should implement the ListEndpoints method.
@@ -82,9 +88,26 @@ func (ep *Endpoint) Dst() string {
 	return net.JoinHostPort(ep.Name, strconv.Itoa(ep.Port))
 }
 
+type resolverOptions struct {
+	nameOverride string
+}
+
+type ResolverOption func(*resolverOptions)
+
+func WithNameOverride(nameOverride string) ResolverOption {
+	return func(ro *resolverOptions) {
+		ro.nameOverride = nameOverride
+	}
+}
+
 // Resolve resolves endpoint to an IP address. If endpoint has an embedded IP
 // address it uses that, otherwise a global reolver is used.
-func (ep *Endpoint) Resolve(ipVersion int, resolver Resolver) (net.IP, error) {
+func (ep *Endpoint) Resolve(ipVersion int, resolver Resolver, opts ...ResolverOption) (net.IP, error) {
+	ro := &resolverOptions{}
+	for _, opt := range opts {
+		opt(ro)
+	}
+
 	if ep.IP != nil {
 		if ipVersion == 0 || iputils.IPVersion(ep.IP) == ipVersion {
 			return ep.IP, nil
@@ -93,7 +116,11 @@ func (ep *Endpoint) Resolve(ipVersion int, resolver Resolver) (net.IP, error) {
 		return nil, fmt.Errorf("no IPv%d address (IP: %s) for %s", ipVersion, ep.IP.String(), ep.Name)
 	}
 
-	return resolver.Resolve(ep.Name, ipVersion)
+	name := ep.Name
+	if ro.nameOverride != "" {
+		name = ro.nameOverride
+	}
+	return resolver.Resolve(name, ipVersion)
 }
 
 // NamesFromEndpoints is convenience function to build a list of names
@@ -104,4 +131,63 @@ func NamesFromEndpoints(endpoints []Endpoint) []string {
 		result[i] = ep.Name
 	}
 	return result
+}
+
+func parseURL(s string) (scheme, host, path string, port int, err error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", "", "", 0, fmt.Errorf("invalid URL: %v", err)
+	}
+
+	scheme = u.Scheme
+	host = u.Hostname()
+	port, _ = strconv.Atoi(u.Port())
+	path = "/"
+
+	hostPath := strings.TrimPrefix(s, scheme+"://")
+	if i := strings.Index(hostPath, "/"); i != -1 {
+		path = hostPath[i:]
+	}
+	return scheme, host, path, port, nil
+}
+
+func FromProtoMessage(endpointspb []*targetspb.Endpoint) ([]Endpoint, error) {
+	var endpoints []Endpoint
+	seen := make(map[string]bool)
+	timestamp := time.Now()
+
+	for _, pb := range endpointspb {
+		ep := Endpoint{
+			Name:        pb.GetName(),
+			Labels:      pb.GetLabels(),
+			IP:          net.ParseIP(pb.GetIp()),
+			Port:        int(pb.GetPort()),
+			LastUpdated: timestamp,
+		}
+
+		if pb.GetUrl() != "" {
+			scheme, host, path, port, err := parseURL(pb.GetUrl())
+			if err != nil {
+				return nil, err
+			}
+			if ep.Labels == nil {
+				ep.Labels = make(map[string]string)
+			}
+			ep.Labels["__cp_scheme__"] = scheme
+			ep.Labels["__cp_host__"] = host
+			ep.Labels["__cp_path__"] = path
+
+			if ep.Port == 0 {
+				ep.Port = port
+			}
+		}
+		epKey := ep.Key()
+		if seen[epKey] {
+			return nil, fmt.Errorf("duplicate endpoint: %s", ep.Key())
+		}
+		seen[epKey] = true
+		endpoints = append(endpoints, ep)
+	}
+
+	return endpoints, nil
 }

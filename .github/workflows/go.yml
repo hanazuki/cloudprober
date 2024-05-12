@@ -26,17 +26,18 @@ jobs:
       PING_HOSTS_V4: 127.0.1.1,localhost
       PING_HOSTS_V6: localhost
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Check out code into the Go module directory
-        if: ${{ !contains(github.event_name, 'workflow_dispatch') }}
+        if: github.event_name != 'workflow_dispatch'
         uses: actions/checkout@v2
         with:
           fetch-depth: 0
 
       - name: Check out code into the Go module directory
-        if: ${{ contains(github.event_name, 'workflow_dispatch') }}
+        if: github.event_name == 'workflow_dispatch'
         uses: actions/checkout@v2
         with:
           fetch-depth: 0
@@ -50,7 +51,7 @@ jobs:
         id: go
 
       - name: Set DISABLE_IPV6_TESTS on Windows OS
-        if: ${{ matrix.os == 'windows-latest' }}
+        if: matrix.os == 'windows-latest'
         run: echo "DISABLE_IPV6_TESTS=yes" >> $env:GITHUB_ENV
 
       - name: Get dependencies
@@ -60,19 +61,46 @@ jobs:
         run: go build -v .
 
       - name: Set up ubuntu for testing
-        if: ${{ matrix.os == 'ubuntu-latest' }}
+        if: matrix.os == 'ubuntu-latest'
         run: sudo sudo sysctl -w net.ipv4.ping_group_range="0 500000"
 
-      - name: Test
+      - name: Test on ubuntu
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          go install gotest.tools/gotestsum@latest
+          gotestsum --jsonfile=report.json --rerun-fails --packages=./... -- ${{ env.EXTRA_TEST_FLAGS }} -race -covermode=atomic -coverprofile=cover.out
+
+      - name: Test on non-ubuntu
+        if: matrix.os != 'ubuntu-latest'
         run: |
           go install gotest.tools/gotestsum@latest
           gotestsum --rerun-fails --packages=./... -- ${{ env.EXTRA_TEST_FLAGS }} -race -covermode=atomic
 
+      - name: SonarCloud Scan
+        if: matrix.os == 'ubuntu-latest' &&  github.repository == 'cloudprober/cloudprober' && (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+        uses: SonarSource/sonarcloud-github-action@master
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
       - name: Privileged ping tests.
-        if: ${{ matrix.os != 'windows-latest' }}
+        if: matrix.os != 'windows-latest'
         run: |
           go test github.com/cloudprober/cloudprober/probes/ping -c
           sudo PING_HOSTS_V4=${{ env.PING_HOSTS_V4 }} PING_HOSTS_V6=${{ env.PING_HOSTS_V6 }} ./ping.test -test.v -test.run ^TestRunProbeRealICMP$
+
+      - name: Example config tests
+        if: matrix.os == 'ubuntu-latest'
+        run: tools/test_example_configs.sh
+
+      - name: Upload test and coverage reports
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-reports
+          path: |
+            report.json
+            cover.out
 
   build-binaries:
     name: Build binaries
@@ -152,7 +180,7 @@ jobs:
 
   build_and_push_docker_multiarch:
     name: Build and push multiarch docker image
-    if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags')
+    if: github.repository == 'cloudprober/cloudprober' && (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
     needs: [build-and-test, build-binaries]
     runs-on: ubuntu-latest
 

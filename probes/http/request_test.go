@@ -1,4 +1,4 @@
-// Copyright 2019-2020 The Cloudprober Authors.
+// Copyright 2019-2023 The Cloudprober Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,13 +17,18 @@ package http
 import (
 	"fmt"
 	"net"
+	"net/http"
 	"testing"
+	"time"
 
+	"github.com/cloudprober/cloudprober/internal/httpreq"
 	configpb "github.com/cloudprober/cloudprober/probes/http/proto"
 	"github.com/cloudprober/cloudprober/probes/options"
 	"github.com/cloudprober/cloudprober/targets"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
-	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+	"golang.org/x/oauth2"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestHostWithPort(t *testing.T) {
@@ -51,7 +56,18 @@ func TestHostWithPort(t *testing.T) {
 	}
 }
 
-func TestURLHostAndHeaderForTarget(t *testing.T) {
+func TestHandleIPv6(t *testing.T) {
+	tests := map[string]string{
+		"2600:2d00:4030:a47:c0a8:210d:0:0": "[2600:2d00:4030:a47:c0a8:210d:0:0]",
+		"cloudprober.org":                  "cloudprober.org",
+		"10.12.13.14":                      "10.12.13.14",
+	}
+	for in, want := range tests {
+		assert.Equalf(t, want, handleIPv6(in), "handleIPv6(%s) is not as expected", in)
+	}
+}
+
+func TestURLHostAndHeader(t *testing.T) {
 	for _, test := range []struct {
 		name            string
 		fqdn            string
@@ -101,61 +117,65 @@ func TestURLHostAndHeaderForTarget(t *testing.T) {
 			wantURLHost:     "target1",
 		},
 	} {
-		t.Run(fmt.Sprintf("test:%+v", test), func(t *testing.T) {
+		t.Run("", func(t *testing.T) {
 			target := endpoint.Endpoint{
 				Name:   test.name,
 				Labels: map[string]string{"fqdn": test.fqdn},
 			}
 
-			hostHeader := hostHeaderForTarget(target, test.probeHostHeader, test.port)
-			if hostHeader != test.wantHostHeader {
-				t.Errorf("Got host header: %s, want header: %s", hostHeader, test.wantHostHeader)
-			}
-
-			urlHost := urlHostForTarget(target)
+			urlHost := hostForTarget(target)
 			if urlHost != test.wantURLHost {
 				t.Errorf("Got URL host: %s, want URL host: %s", urlHost, test.wantURLHost)
 			}
+
+			p := &Probe{
+				c: &configpb.ProbeConf{
+					Header: map[string]string{
+						"Host":         test.probeHostHeader,
+						"X-Probe-Name": "probe1",
+					},
+				},
+			}
+
+			req, _ := http.NewRequest("GET", "http://cloudprober.org", nil)
+			p.setHeaders(req, urlHost, test.port)
+			assert.Equal(t, test.wantHostHeader, req.Host, "host header mismatch")
+			assert.Equal(t, "probe1", req.Header.Get("X-Probe-Name"), "probe name header mismatch")
 		})
 	}
 }
 
-func TestRelURLforTarget(t *testing.T) {
-	for _, test := range []struct {
-		targetURLLabel string
-		probeURL       string
-		wantRelURL     string
-	}{
-		{
-			// Both set, probe URL wins.
-			targetURLLabel: "/target-url",
-			probeURL:       "/metrics",
-			wantRelURL:     "/metrics",
-		},
-		{
-			// Only target label set.
-			targetURLLabel: "/target-url",
-			probeURL:       "",
-			wantRelURL:     "/target-url",
-		},
-		{
-			// Nothing set, we get nothing.
-			targetURLLabel: "",
-			probeURL:       "",
-			wantRelURL:     "",
-		},
-	} {
-		t.Run(fmt.Sprintf("test:%+v", test), func(t *testing.T) {
-			target := endpoint.Endpoint{
-				Name:   "test-target",
-				Labels: map[string]string{relURLLabel: test.targetURLLabel},
-			}
+func TestPathforTarget(t *testing.T) {
+	allLabels := map[string]string{
+		relURLLabel:   "/target-url",
+		"__cp_path__": "target-cp-path", // "/" is added automatically.
+	}
 
-			relURL := relURLForTarget(target, test.probeURL)
-			if relURL != test.wantRelURL {
-				t.Errorf("Got URL: %s, want: %s", relURL, test.wantRelURL)
-			}
-		})
+	// This is a map of wanted output to defined labels.
+	tests := map[string][]string{
+		"/target-url":     {relURLLabel, "__cp_path__"},
+		"/target-cp-path": {"__cp_path__"},
+	}
+
+	for want, labelKeys := range tests {
+		for _, probeURL := range []string{"", "/metrics"} {
+			t.Run(fmt.Sprintf("want:%s,probeURL:%s", want, probeURL), func(t *testing.T) {
+				labels := map[string]string{}
+				for _, labelKey := range labelKeys {
+					labels[labelKey] = allLabels[labelKey]
+				}
+				target := endpoint.Endpoint{
+					Name:   "test-target",
+					Labels: labels,
+				}
+				gotPath := pathForTarget(target, probeURL)
+				if probeURL != "" {
+					assert.Equal(t, probeURL, gotPath, "path is not set to non-empty probeURL")
+				} else {
+					assert.Equal(t, want, gotPath, "path is not set to expected value")
+				}
+			})
+		}
 	}
 }
 
@@ -167,35 +187,32 @@ type testData struct {
 	resolvedIP string // IP that will be returned by the test resolve function.
 
 	// Probe configuration parameters
-	resolveFirst bool
-	probeHost    string
+	probeHost string
 
 	// Used by TestURLHostAndHeaderForTarget to verify URL host, and
 	// TestRequestHostAndURL to build URL to verify.
-	wantURLHost string
+	wantURLHost    string
+	wantHostHeader string
 }
 
 func createRequestAndVerify(t *testing.T, td testData, probePort, targetPort, expectedPort int) {
 	t.Helper()
 
-	p := &Probe{
-		protocol: "http",
-		c: &configpb.ProbeConf{
-			ResolveFirst: proto.Bool(td.resolveFirst),
+	// Initialize proe
+	p := &Probe{}
+	opts := options.DefaultOptions()
+	c := &configpb.ProbeConf{
+		Port: proto.Int32(int32(probePort)),
+		Header: map[string]string{
+			"X-Probe-Name": "probe1",
 		},
-		opts: &options.Options{Targets: targets.StaticTargets(td.targetName)},
 	}
-
-	if probePort != 0 {
-		p.c.Port = proto.Int32(int32(probePort))
-	}
-
 	if td.probeHost != "" {
-		p.c.Headers = append(p.c.Headers, &configpb.ProbeConf_Header{
-			Name:  proto.String("Host"),
-			Value: proto.String(td.probeHost),
-		})
+		c.Header["Host"] = td.probeHost
 	}
+	opts.ProbeConf = c
+	opts.Targets = targets.StaticTargets(td.targetName)
+	assert.NoError(t, p.Init("test", opts), "Error initializing probe")
 
 	target := endpoint.Endpoint{
 		Name: td.targetName,
@@ -208,15 +225,10 @@ func createRequestAndVerify(t *testing.T, td testData, probePort, targetPort, ex
 	req := p.httpRequestForTarget(target)
 
 	wantURL := fmt.Sprintf("http://%s", hostWithPort(td.wantURLHost, expectedPort))
-	if req.URL.String() != wantURL {
-		t.Errorf("HTTP req URL: %s, wanted: %s", req.URL.String(), wantURL)
-	}
+	assert.Equal(t, wantURL, req.URL.String(), "URL mismatch")
 
-	// Note that we test hostHeaderForTarget independently.
-	wantHostHeader := hostHeaderForTarget(target, td.probeHost, expectedPort)
-	if req.Host != wantHostHeader {
-		t.Errorf("HTTP req.Host: %s, wanted: %s", req.Host, wantHostHeader)
-	}
+	assert.Equal(t, td.wantHostHeader, req.Host, "host header mismatch")
+	assert.Equal(t, "probe1", req.Header.Get("X-Probe-Name"), "probe name header mismatch")
 }
 
 func testRequestHostAndURLWithDifferentPorts(t *testing.T, td testData) {
@@ -244,6 +256,10 @@ func testRequestHostAndURLWithDifferentPorts(t *testing.T, td testData) {
 		},
 	} {
 		t.Run(fmt.Sprintf("%s_probe_port_%d_endpoint_port_%d", td.desc, ports.probePort, ports.targetPort), func(t *testing.T) {
+			td := td
+			if td.probeHost == "" {
+				td.wantHostHeader = hostWithPort(td.wantHostHeader, ports.expectedPort)
+			}
 			createRequestAndVerify(t, td, ports.probePort, ports.targetPort, ports.expectedPort)
 		})
 	}
@@ -251,55 +267,237 @@ func testRequestHostAndURLWithDifferentPorts(t *testing.T, td testData) {
 
 func TestRequestHostAndURL(t *testing.T) {
 	tests := []testData{
+		// No resolve first
 		{
-			desc:        "no_resolve_first,no_probe_host_header",
-			targetName:  "test-target.com",
-			wantURLHost: "test-target.com",
+			desc:           "no_resolve_first,no_probe_host_header",
+			targetName:     "test-target.com",
+			wantURLHost:    "test-target.com",
+			wantHostHeader: "test-target.com",
 		},
 		{
-			desc:        "no_resolve_first,fqdn,no_probe_host_header",
-			targetName:  "test-target.com",
-			targetFQDN:  "test.svc.cluster.local",
-			wantURLHost: "test.svc.cluster.local",
+			desc:           "no_resolve_first,fqdn,no_probe_host_header",
+			targetName:     "test-target.com",
+			targetFQDN:     "test.svc.cluster.local",
+			wantURLHost:    "test.svc.cluster.local",
+			wantHostHeader: "test.svc.cluster.local",
 		},
 		{
-			desc:        "no_resolve_first,host_header",
-			targetName:  "test-target.com",
-			probeHost:   "test-host",
-			wantURLHost: "test-target.com",
+			desc:           "no_resolve_first,host_header",
+			targetName:     "test-target.com",
+			probeHost:      "test-host",
+			wantURLHost:    "test-target.com",
+			wantHostHeader: "test-host",
 		},
 		{
-			desc:        "ipv6_literal_host,no_probe_host_header",
-			targetName:  "2600:2d00:4030:a47:c0a8:210d:0:0", // IPv6 literal host
-			wantURLHost: "[2600:2d00:4030:a47:c0a8:210d:0:0]",
+			desc:           "ipv6_literal_host,no_probe_host_header",
+			targetName:     "2600:2d00:4030:a47:c0a8:210d:0:0", // IPv6 literal host
+			wantURLHost:    "[2600:2d00:4030:a47:c0a8:210d:0:0]",
+			wantHostHeader: "[2600:2d00:4030:a47:c0a8:210d:0:0]",
+		},
+		// Resolves first, as resolved IP is given.
+		{
+			desc:           "resolve_first,no_probe_host_header",
+			targetName:     "localhost",
+			resolvedIP:     "127.0.0.1",
+			wantURLHost:    "127.0.0.1",
+			wantHostHeader: "localhost",
 		},
 		{
-			desc:         "resolve_first,no_probe_host_header",
-			targetName:   "localhost",
-			resolveFirst: true,
-			resolvedIP:   "127.0.0.1",
-			wantURLHost:  "127.0.0.1",
+			desc:           "resolve_first,ipv6,no_probe_host_header",
+			targetName:     "localhost",
+			resolvedIP:     "2600:2d00:4030:a47:c0a8:210d:0:0", // Resolved IP
+			wantURLHost:    "[2600:2d00:4030:a47:c0a8:210d::]", // IPv6 literal host
+			wantHostHeader: "localhost",
 		},
 		{
-			desc:         "resolve_first,ipv6,no_probe_host_header",
-			targetName:   "localhost",
-			resolveFirst: true,
-			resolvedIP:   "2600:2d00:4030:a47:c0a8:210d:0:0", // Resolved IP
-			wantURLHost:  "[2600:2d00:4030:a47:c0a8:210d::]", // IPv6 literal host
-		},
-		{
-			desc:         "resolve_first,probe_host_header",
-			targetName:   "localhost",
-			resolveFirst: true,
-			probeHost:    "test-host",
-			resolvedIP:   "127.0.0.1",
-			wantURLHost:  "127.0.0.1",
+			desc:           "resolve_first,probe_host_header",
+			targetName:     "localhost",
+			probeHost:      "test-host",
+			resolvedIP:     "127.0.0.1",
+			wantURLHost:    "127.0.0.1",
+			wantHostHeader: "test-host",
 		},
 	}
 
 	for _, td := range tests {
 		t.Run(td.desc, func(t *testing.T) {
 			testRequestHostAndURLWithDifferentPorts(t, td)
+		})
+	}
+}
+
+type fakeTokenSource struct {
+	token string
+}
+
+func (fts *fakeTokenSource) Token() (*oauth2.Token, error) {
+	return &oauth2.Token{AccessToken: fts.token}, nil
+}
+
+func TestPrepareRequest(t *testing.T) {
+	data := []string{}
+	for i := 0; i < 500; i++ {
+		data = append(data, fmt.Sprintf("data-%03d", i))
+	}
+	tests := []struct {
+		name         string
+		token        string
+		data         []string
+		wantIsCloned bool
+		wantNewBody  bool
+	}{
+		{
+			name: "No token source, no body",
+		},
+		{
+			name:         "No token source, small body",
+			data:         data[0:20],
+			wantIsCloned: true,
+			wantNewBody:  true,
+		},
+		{
+			name:         "No token source, large body",
+			data:         data,
+			wantIsCloned: true,
+			wantNewBody:  true,
+		},
+		{
+			name:         "token source, no body",
+			token:        "test-token",
+			wantIsCloned: true,
+			wantNewBody:  false, // Only request is cloned.
+		},
+		{
+			name:         "token source, small body",
+			data:         data[0:20],
+			token:        "test-token",
+			wantIsCloned: true,
+			wantNewBody:  true,
+		},
+		{
+			name:         "token source, large body",
+			data:         data,
+			token:        "test-token",
+			wantIsCloned: true,
+			wantNewBody:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Probe{
+				requestBody: httpreq.NewRequestBody(tt.data...),
+			}
+			if tt.token != "" {
+				p.oauthTS = &fakeTokenSource{token: tt.token}
+			}
+
+			inReq, _ := httpreq.NewRequest("GET", "http://cloudprober.org", p.requestBody)
+			got := p.prepareRequest(inReq)
+
+			if tt.wantIsCloned != (inReq != got) {
+				t.Errorf("wantIsCloned=%v, (inReq != got) is %v", tt.wantIsCloned, inReq != got)
+			}
+
+			if tt.wantNewBody != (inReq.Body != got.Body) {
+				t.Errorf("wantNewBody=%v, (inReq.Body != got.Body) is %v", tt.wantNewBody, inReq.Body != got.Body)
+			}
+
+			if tt.token != "" {
+				assert.Equal(t, "Bearer "+tt.token, got.Header.Get("Authorization"), "Token mismatch")
+			}
+
+			if len(tt.data) != 0 {
+				assert.NotNil(t, inReq.GetBody, "GetBody is nil")
+				assert.NotNil(t, got.GetBody, "GetBody is nil")
+			}
+		})
+	}
+}
+
+func TestRequestHasConfiguredHeaders(t *testing.T) {
+	p := &Probe{}
+
+	testHeaderName := "X-My-Test-Header"
+	testHeaderValue := "foo"
+
+	testHeadersName := "X-My-Other-Header"
+	testHeadersValue := "bar"
+
+	opts := &options.Options{
+		Targets:  targets.StaticTargets("test.com"),
+		Interval: 10 * time.Millisecond,
+		ProbeConf: &configpb.ProbeConf{
+			MaxRedirects: nil,
+			Header:       map[string]string{testHeaderName: testHeaderValue},
+			Headers:      []*configpb.ProbeConf_Header{{Name: &testHeadersName, Value: &testHeadersValue}},
+		},
+	}
+
+	err := p.Init("http_test", opts)
+	if err != nil {
+		t.Errorf("Unexpected error: %v", err)
+	}
+
+	target := endpoint.Endpoint{
+		Name:   "header-test",
+		Labels: map[string]string{"fqdn": "test.com"},
+	}
+
+	req := p.httpRequestForTarget(target)
+
+	val, ok := req.Header[testHeaderName]
+	assert.True(t, ok, "Configured header (via 'header' setting) is not present in target request")
+	assert.Contains(t, val, testHeaderValue)
+
+	val, ok = req.Header[testHeadersName]
+	assert.True(t, ok, "Configured header (via 'headers' setting) is not present in target request")
+	assert.Contains(t, val, testHeadersValue)
+}
+
+func TestResolveFirst(t *testing.T) {
+	tests := []struct {
+		name   string
+		target endpoint.Endpoint
+		conf   *configpb.ProbeConf
+		want   bool
+	}{
+		{
+			name:   "resolve_first_false",
+			target: endpoint.Endpoint{Name: "cloudprober.org"},
+			conf:   &configpb.ProbeConf{},
+			want:   false,
+		},
+		{
+			name:   "resolve_first_true",
+			target: endpoint.Endpoint{Name: "cloudprober.org"},
+			conf:   &configpb.ProbeConf{ResolveFirst: proto.Bool(true)},
+			want:   true,
+		},
+		{
+			name: "resolve_first_true_with_ip",
+			target: endpoint.Endpoint{
+				Name: "cloudprober.org",
+				IP:   net.ParseIP("1.1.1.1"),
+			},
+			conf: &configpb.ProbeConf{},
+			want: true,
+		},
+		{
+			name: "resolve_first_explcitly_false",
+			target: endpoint.Endpoint{
+				Name: "cloudprober.org",
+				IP:   net.ParseIP("1.1.1.1"),
+			},
+			conf: &configpb.ProbeConf{ResolveFirst: proto.Bool(false)},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := &Probe{
+				c: tt.conf,
+			}
+			assert.Equal(t, tt.want, p.resolveFirst(tt.target), "resolveFirst is not as expected")
 		})
 	}
 }

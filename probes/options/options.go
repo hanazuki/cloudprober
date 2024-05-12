@@ -19,18 +19,19 @@ package options
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"time"
 
 	"github.com/cloudprober/cloudprober/common/iputils"
+	"github.com/cloudprober/cloudprober/internal/alerting"
+	"github.com/cloudprober/cloudprober/internal/validators"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
-	"github.com/cloudprober/cloudprober/probes/alerting"
 	configpb "github.com/cloudprober/cloudprober/probes/proto"
 	"github.com/cloudprober/cloudprober/targets"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 	targetspb "github.com/cloudprober/cloudprober/targets/proto"
-	"github.com/cloudprober/cloudprober/validators"
 )
 
 // Options encapsulates common probe options.
@@ -48,6 +49,7 @@ type Options struct {
 	StatsExportInterval time.Duration
 	LogMetrics          func(*metrics.EventMetrics)
 	AdditionalLabels    []*AdditionalLabel
+	Schedule            *Schedule
 	NegativeTest        bool
 	AlertHandlers       []*alerting.AlertHandler
 }
@@ -149,6 +151,10 @@ func BuildProbeOptions(p *configpb.ProbeDef, ldLister endpoint.Lister, globalTar
 		}
 	}
 
+	if intervalDuration < timeoutDuration && p.GetType() != configpb.ProbeDef_UDP {
+		return nil, fmt.Errorf("interval (%v) cannot be smaller than timeout (%v)", intervalDuration, timeoutDuration)
+	}
+
 	if p.GetNegativeTest() && !negativeTestSupported[p.GetType()] {
 		return nil, fmt.Errorf("negative_test is not supported by %s probes", p.GetType().String())
 	}
@@ -159,10 +165,17 @@ func BuildProbeOptions(p *configpb.ProbeDef, ldLister endpoint.Lister, globalTar
 		IPVersion:         ipv(p.IpVersion),
 		LatencyMetricName: p.GetLatencyMetricName(),
 		NegativeTest:      p.GetNegativeTest(),
+		Logger:            logger.NewWithAttrs(slog.String("probe", p.GetName())),
 	}
 
-	if opts.Logger, err = logger.NewCloudproberLog(p.GetName()); err != nil {
-		return nil, fmt.Errorf("error in initializing logger for the probe (%s): %v", p.GetName(), err)
+	if p.GetTargets() == nil {
+		if p.GetType() != configpb.ProbeDef_USER_DEFINED && p.GetType() != configpb.ProbeDef_EXTERNAL && p.GetType() != configpb.ProbeDef_EXTENSION {
+			return nil, fmt.Errorf("targets requied for probe type: %s", p.GetType().String())
+		} else {
+			p.Targets = &targetspb.TargetsDef{
+				Type: &targetspb.TargetsDef_DummyTargets{},
+			}
+		}
 	}
 
 	if opts.Targets, err = targets.New(p.GetTargets(), ldLister, globalTargetsOpts, l, opts.Logger); err != nil {
@@ -212,14 +225,18 @@ func BuildProbeOptions(p *configpb.ProbeDef, ldLister endpoint.Lister, globalTar
 	opts.AdditionalLabels = parseAdditionalLabels(p)
 
 	for _, alertConf := range p.GetAlert() {
-		if alertConf.GetName() == "" {
-			alertConf.Name = p.GetName()
-		}
-		ah, err := alerting.NewAlertHandler(alertConf, opts.Logger)
+		ah, err := alerting.NewAlertHandler(alertConf, p.GetName(), opts.Logger)
 		if err != nil {
-			return nil, fmt.Errorf("error in initializing alert handler: %v", err)
+			return nil, fmt.Errorf("error creating alert handler for the probe (%s): %v", p.GetName(), err)
 		}
 		opts.AlertHandlers = append(opts.AlertHandlers, ah)
+	}
+
+	if p.GetSchedule() != nil {
+		opts.Schedule, err = NewSchedule(p.GetSchedule(), opts.Logger)
+		if err != nil {
+			return nil, fmt.Errorf("error creating schedule for the probe (%s): %v", p.GetName(), err)
+		}
 	}
 
 	if !p.GetDebugOptions().GetLogMetrics() {
@@ -252,4 +269,40 @@ func DefaultOptions() *Options {
 	}
 
 	return opts
+}
+
+type recordOptions struct {
+	NoAlert bool
+}
+
+type RecordOptions func(*recordOptions)
+
+func WithNoAlert() RecordOptions {
+	return func(ro *recordOptions) {
+		ro.NoAlert = true
+	}
+}
+
+func (opts *Options) IsScheduled() bool {
+	return opts.Schedule.isIn(time.Now())
+}
+
+func (opts *Options) RecordMetrics(ep endpoint.Endpoint, em *metrics.EventMetrics, dataChan chan<- *metrics.EventMetrics, ropts ...RecordOptions) {
+	em.LatencyUnit = opts.LatencyUnit
+	for _, al := range opts.AdditionalLabels {
+		em.AddLabel(al.KeyValueForTarget(ep))
+	}
+
+	opts.LogMetrics(em)
+	dataChan <- em.Clone()
+
+	ro := &recordOptions{}
+	for _, ropt := range ropts {
+		ropt(ro)
+	}
+	if !ro.NoAlert {
+		for _, ah := range opts.AlertHandlers {
+			ah.Record(ep, em)
+		}
+	}
 }

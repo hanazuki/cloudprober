@@ -114,8 +114,13 @@ find ${MODULE} -type d | \
     ${protoc_path} --go-grpc_out=. --go_out=. ${dir}/*.proto
   done
 
+${protoc_path} --python_out=. ${MODULE}/probes/external/proto/server.proto
+PY_SRC_DIR=${MODULE}/probes/external/serverutils/py/src/cloudprober/external
+mkdir -p ${PY_SRC_DIR}
+mv github/com/cloudprober/cloudprober/probes/external/proto/server_pb2.py ${PY_SRC_DIR}
+
 # Copy generated files back to their original location.
-find ${MODULE} \( -name *.pb.go -o -name *proto_gen.cue \) | \
+find ${MODULE} \( -name *.pb.go -o -name *proto_gen.cue -o -name *.py \) | \
   while read -r pbgofile
   do
     dst=${PROJECTROOT}/${pbgofile/github.com\/cloudprober\//}

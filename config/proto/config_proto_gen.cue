@@ -3,12 +3,20 @@ package proto
 import (
 	"github.com/cloudprober/cloudprober/probes/proto"
 	proto_1 "github.com/cloudprober/cloudprober/surfacers/proto"
-	proto_5 "github.com/cloudprober/cloudprober/servers/proto"
-	proto_A "github.com/cloudprober/cloudprober/rds/server/proto"
-	proto_8 "github.com/cloudprober/cloudprober/common/tlsconfig/proto"
+	proto_5 "github.com/cloudprober/cloudprober/internal/servers/proto"
+	proto_A "github.com/cloudprober/cloudprober/internal/rds/server/proto"
+	proto_8 "github.com/cloudprober/cloudprober/internal/tlsconfig/proto"
 	proto_E "github.com/cloudprober/cloudprober/targets/proto"
 )
 
+// Cloudprober config proto defines the config schema. Cloudprober config can
+// either be in YAML or textproto format.
+//
+// Cloudprober uses Go text templates along with Sprig functions[1] to add
+// programming capabilities to the configs.
+// [1]- http://masterminds.github.io/sprig/
+// Config template examples:
+// https://github.com/cloudprober/cloudprober/tree/master/examples/templates
 #ProberConfig: {
 	// Probes to run.
 	probe?: [...proto.#ProbeDef] @protobuf(1,probes.ProbeDef)
@@ -29,14 +37,12 @@ import (
 	server?: [...proto_5.#ServerDef] @protobuf(3,servers.ServerDef)
 
 	// Shared targets allow you to re-use the same targets copy across multiple
-	// probes. Example usage:
-	//
+	// probes.
+	// Example:
 	// shared_targets {
 	//   name: "internal-vms"
 	//   targets {
-	//     rds_targets {
-	//       ..
-	//     }
+	//     rds_targets {...}
 	//   }
 	// }
 	//
@@ -76,12 +82,12 @@ import (
 
 	// TLS config, it can be used to:
 	// - Specify client's CA cert for client cert verification:
-	//     tls_config {
+	//     grpc_tls_config {
 	//       ca_cert_file: "...."
 	//     }
 	//
 	// - Specify TLS cert and key:
-	//     tls_config {
+	//     grpc_tls_config {
 	//       tls_cert_file: "..."
 	//       tls_key_file: "..."
 	//     }
@@ -98,7 +104,7 @@ import (
 	disableJitter?: bool @protobuf(102,bool,name=disable_jitter,"default=false")
 
 	// How often to export system variables. To learn more about system variables:
-	// http://godoc.org/github.com/cloudprober/cloudprober/sysvars.
+	// http://godoc.org/github.com/cloudprober/cloudprober/internal/sysvars.
 	sysvarsIntervalMsec?: int32 @protobuf(97,int32,name=sysvars_interval_msec,"default=10000")
 
 	// Variables specified in this environment variable are exported as it is.

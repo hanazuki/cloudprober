@@ -22,13 +22,13 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/cloudprober/cloudprober/internal/validators"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
 	"github.com/cloudprober/cloudprober/probes/common/sched"
 	"github.com/cloudprober/cloudprober/probes/options"
 	configpb "github.com/cloudprober/cloudprober/probes/tcp/proto"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
-	"github.com/cloudprober/cloudprober/validators"
 )
 
 // Probe holds aggregate information about all probe runs, per-target.
@@ -45,8 +45,8 @@ type Probe struct {
 
 type probeResult struct {
 	total, success    int64
-	latency           metrics.Value
-	validationFailure *metrics.Map
+	latency           metrics.LatencyValue
+	validationFailure *metrics.Map[int64]
 }
 
 func (p *Probe) newResult() sched.ProbeResult {
@@ -57,7 +57,7 @@ func (p *Probe) newResult() sched.ProbeResult {
 	}
 
 	if p.opts.LatencyDist != nil {
-		result.latency = p.opts.LatencyDist.Clone()
+		result.latency = p.opts.LatencyDist.CloneDist()
 	} else {
 		result.latency = metrics.NewFloat(0)
 	}
@@ -69,7 +69,7 @@ func (result *probeResult) Metrics(ts time.Time, opts *options.Options) *metrics
 	em := metrics.NewEventMetrics(ts).
 		AddMetric("total", metrics.NewInt(result.total)).
 		AddMetric("success", metrics.NewInt(result.success)).
-		AddMetric(opts.LatencyMetricName, result.latency).
+		AddMetric(opts.LatencyMetricName, result.latency.Clone()).
 		AddLabel("ptype", "tcp")
 
 	if result.validationFailure != nil {
@@ -127,6 +127,8 @@ func (p *Probe) runProbe(ctx context.Context, target endpoint.Endpoint, res sche
 	// Convert interface to struct type
 	result := res.(*probeResult)
 
+	result.total++
+
 	host := target.Name
 	ipLabel := ""
 
@@ -162,8 +164,6 @@ func (p *Probe) runProbe(ctx context.Context, target endpoint.Endpoint, res sche
 	if conn != nil {
 		defer conn.Close()
 	}
-
-	result.total++
 
 	if p.opts.NegativeTest {
 		if err == nil {

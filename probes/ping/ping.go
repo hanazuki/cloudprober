@@ -32,7 +32,8 @@ local port to find the correct destination socket.
 More about these sockets: http://lwn.net/Articles/420800/
 Note: On some linux distributions these sockets are not enabled by default; you
 can enable them by doing something like the following:
-      sudo sysctl -w net.ipv4.ping_group_range="0 5000"
+
+	sudo sysctl -w net.ipv4.ping_group_range="0 5000"
 */
 package ping
 
@@ -49,14 +50,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudprober/cloudprober/internal/validators"
+	"github.com/cloudprober/cloudprober/internal/validators/integrity"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
 	"github.com/cloudprober/cloudprober/probes/options"
 	configpb "github.com/cloudprober/cloudprober/probes/ping/proto"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
-	"github.com/cloudprober/cloudprober/validators"
-	"github.com/cloudprober/cloudprober/validators/integrity"
-	"github.com/golang/protobuf/proto"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -70,8 +71,8 @@ const (
 
 type result struct {
 	sent, rcvd        int64
-	latency           metrics.Value
-	validationFailure *metrics.Map
+	latency           metrics.LatencyValue
+	validationFailure *metrics.Map[int64]
 }
 
 // icmpConn is an interface wrapper for *icmp.PacketConn to allow testing.
@@ -123,7 +124,11 @@ func (p *Probe) initInternal() error {
 	if !ok {
 		return errors.New("no ping config")
 	}
+
 	p.c = c
+	if p.c == nil {
+		p.c = &configpb.ProbeConf{}
+	}
 
 	if p.l = p.opts.Logger; p.l == nil {
 		p.l = &logger.Logger{}
@@ -250,9 +255,9 @@ func (p *Probe) updateResultForTarget(t string) {
 		return
 	}
 
-	var latencyValue metrics.Value
+	var latencyValue metrics.LatencyValue
 	if p.opts.LatencyDist != nil {
-		latencyValue = p.opts.LatencyDist.Clone()
+		latencyValue = p.opts.LatencyDist.CloneDist()
 	} else {
 		latencyValue = metrics.NewFloat(0)
 	}
@@ -282,17 +287,23 @@ func (p *Probe) sendPackets(runID uint16, tracker chan bool) {
 
 	for {
 		for _, target := range p.targets {
+			p.results[target.Name].sent++
+
 			if p.target2addr[target.Name] == nil {
 				p.l.Debug("Skipping unresolved target: ", target.Name)
 				continue
 			}
+
 			p.prepareRequestPacket(pktbuf, runID, seq, time.Now().UnixNano())
 			if _, err := p.conn.write(pktbuf, p.target2addr[target.Name]); err != nil {
-				p.l.Warning(err.Error())
+				p.l.Error(err.Error())
 				continue
 			}
+
 			tracker <- true
-			p.results[target.Name].sent++
+			// Sleep between pushing packets to avoid network buffer overflow
+			// in case of larger number of targets.
+			time.Sleep(1 * time.Millisecond)
 		}
 
 		packetsSent++
@@ -350,6 +361,7 @@ func (p *Probe) recvPackets(runID uint16, tracker chan bool) {
 			}
 			// if it's a timeout, return immediately.
 			if neterr, ok := err.(*net.OpError); ok && neterr.Timeout() {
+				p.l.Debugf("Network timed out %d", p.runCnt)
 				return
 			}
 			continue
@@ -418,7 +430,7 @@ func (p *Probe) recvPackets(runID uint16, tracker chan bool) {
 
 		// check if this packet belongs to this run
 		if !matchPacket(runID, pkt.id, pkt.seq, p.useDatagramSocket) {
-			p.l.Info("Reply ", pkt.String(rtt), " Unmatched packet, probably from the last probe run.")
+			p.l.Info("Reply ", pkt.String(rtt), " Unmatched packet, probably received after last probe's timeout.")
 			continue
 		}
 
@@ -472,11 +484,11 @@ func (p *Probe) newRunID() uint16 {
 
 // runProbe is called by Run for each probe interval. It does the following on
 // each run:
-//   * Resolve targets if target resolve interval has elapsed.
-//   * Increment run count (runCnt).
-//   * Get a new run ID.
-//   * Starts a goroutine to receive packets.
-//   * Send packets.
+//   - Resolve targets if target resolve interval has elapsed.
+//   - Increment run count (runCnt).
+//   - Get a new run ID.
+//   - Starts a goroutine to receive packets.
+//   - Send packets.
 func (p *Probe) runProbe() {
 	// Resolve targets if target resolve interval has elapsed.
 	if (p.runCnt % uint64(p.c.GetResolveTargetsInterval())) == 0 {
@@ -514,8 +526,13 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 		default:
 		}
 
+		if !p.opts.IsScheduled() {
+			continue
+		}
+
+		p.l.Debugf("Probe started, runcount %d", p.runCnt)
 		p.runProbe()
-		p.l.Debugf("%s: Probe finished.", p.name)
+		p.l.Debugf("Probe finished, runcount %d", p.runCnt)
 		if (p.runCnt % uint64(p.statsExportFreq)) != 0 {
 			continue
 		}
@@ -528,23 +545,18 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 			em := metrics.NewEventMetrics(ts).
 				AddMetric("total", metrics.NewInt(result.sent)).
 				AddMetric("success", metrics.NewInt(success)).
-				AddMetric(p.opts.LatencyMetricName, result.latency).
+				AddMetric(p.opts.LatencyMetricName, result.latency.Clone()).
 				AddLabel("ptype", "ping").
 				AddLabel("probe", p.name).
 				AddLabel("dst", target.Name)
 
 			em.LatencyUnit = p.opts.LatencyUnit
 
-			for _, al := range p.opts.AdditionalLabels {
-				em.AddLabel(al.KeyValueForTarget(target))
-			}
-
 			if p.opts.Validators != nil {
 				em.AddMetric("validation_failure", result.validationFailure)
 			}
 
-			p.opts.LogMetrics(em)
-			dataChan <- em
+			p.opts.RecordMetrics(target, em, dataChan)
 		}
 	}
 }

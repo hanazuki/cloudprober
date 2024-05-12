@@ -15,16 +15,22 @@
 package options
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/cloudprober/cloudprober/common/iputils"
+	"github.com/cloudprober/cloudprober/internal/alerting"
+	alerting_configpb "github.com/cloudprober/cloudprober/internal/alerting/proto"
 	"github.com/cloudprober/cloudprober/logger"
+	"github.com/cloudprober/cloudprober/metrics"
 	configpb "github.com/cloudprober/cloudprober/probes/proto"
+	"github.com/cloudprober/cloudprober/targets/endpoint"
 	targetspb "github.com/cloudprober/cloudprober/targets/proto"
-	"github.com/golang/protobuf/proto"
+	"github.com/stretchr/testify/assert"
+	"google.golang.org/protobuf/proto"
 )
 
 type intf struct {
@@ -212,7 +218,7 @@ func TestStatsExportInterval(t *testing.T) {
 			name:         "Timeout bigger than intervalMsec",
 			intervalMsec: 10,
 			timeoutMsec:  12,
-			want:         12,
+			wantError:    true,
 		},
 		{
 			name:         "Interval and timeout less than default",
@@ -355,6 +361,127 @@ func TestNegativeTestSupport(t *testing.T) {
 			if err == nil {
 				t.Errorf("Didn't get error for unsupported probe type: %v", ptype)
 			}
+		})
+	}
+}
+
+func TestRecordMetrics(t *testing.T) {
+	em := metrics.NewEventMetrics(time.Now()).
+		AddMetric("total", metrics.NewInt(1)).
+		AddMetric("success", metrics.NewInt(0))
+	ep := endpoint.Endpoint{Name: "test_target"}
+	opts := DefaultOptions()
+	additionalLabel := &AdditionalLabel{
+		Key: "test_additional_label",
+		valueForTarget: map[string]string{
+			ep.Key(): "test_value",
+		},
+	}
+
+	var buf bytes.Buffer
+	l := logger.New(logger.WithWriter(&buf))
+	opts.AdditionalLabels = []*AdditionalLabel{additionalLabel}
+	alertHandler, _ := alerting.NewAlertHandler(&alerting_configpb.AlertConf{}, "test-probe", l)
+	opts.AlertHandlers = []*alerting.AlertHandler{alertHandler}
+
+	tests := []struct {
+		name    string
+		noAlert bool
+	}{
+		{
+			name: "default",
+		},
+		{
+			name:    "no alert",
+			noAlert: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf.Reset()
+
+			dataChan := make(chan *metrics.EventMetrics, 3)
+			rOpts := []RecordOptions{}
+			if tt.noAlert {
+				rOpts = append(rOpts, WithNoAlert())
+			}
+			opts.RecordMetrics(ep, em, dataChan, rOpts...)
+			em := <-dataChan
+
+			assert.Equal(t, int64(1), em.Metric("total").(*metrics.Int).Int64())
+			assert.Equal(t, int64(0), em.Metric("success").(*metrics.Int).Int64())
+			assert.Equal(t, "test_value", em.Label("test_additional_label"))
+
+			em = metrics.NewEventMetrics(time.Now()).
+				AddMetric("total", metrics.NewInt(2)).
+				AddMetric("success", metrics.NewInt(0))
+			opts.RecordMetrics(ep, em, dataChan, rOpts...)
+			if !tt.noAlert {
+				assert.Contains(t, buf.String(), "ALERT (test-probe)")
+			} else {
+				assert.NotContains(t, buf.String(), "ALERT (test-probe)")
+			}
+		})
+	}
+}
+
+func TestNilTargets(t *testing.T) {
+	tests := []struct {
+		cfg           *configpb.ProbeDef
+		wantEndpoints []endpoint.Endpoint
+		wantErr       bool
+	}{
+		{
+			cfg: &configpb.ProbeDef{
+				Type: configpb.ProbeDef_PING.Enum(),
+				Name: proto.String("test-probe"),
+			},
+			wantErr: true,
+		},
+		{
+			cfg: &configpb.ProbeDef{
+				Type: configpb.ProbeDef_USER_DEFINED.Enum(),
+				Name: proto.String("test-probe"),
+			},
+			wantEndpoints: []endpoint.Endpoint{{Name: ""}},
+		},
+		{
+			cfg: &configpb.ProbeDef{
+				Type: configpb.ProbeDef_EXTERNAL.Enum(),
+				Name: proto.String("test-probe"),
+			},
+			wantEndpoints: []endpoint.Endpoint{{Name: ""}},
+		},
+		{
+			cfg: &configpb.ProbeDef{
+				Type: configpb.ProbeDef_EXTENSION.Enum(),
+				Name: proto.String("test-probe"),
+			},
+			wantEndpoints: []endpoint.Endpoint{{Name: ""}},
+		},
+		{
+			cfg: &configpb.ProbeDef{
+				Type: configpb.ProbeDef_EXTERNAL.Enum(),
+				Name: proto.String("test-probe"),
+				Targets: &targetspb.TargetsDef{
+					Type: &targetspb.TargetsDef_HostNames{HostNames: "testHost"},
+				},
+			},
+			wantEndpoints: []endpoint.Endpoint{{Name: "testHost"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.cfg.String(), func(t *testing.T) {
+			got, err := BuildProbeOptions(tt.cfg, nil, nil, nil)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("BuildProbeOptions() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if err != nil {
+				return
+			}
+			assert.Equal(t, tt.wantEndpoints, got.Targets.ListEndpoints())
 		})
 	}
 }

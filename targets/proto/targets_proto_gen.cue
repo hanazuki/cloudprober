@@ -1,8 +1,8 @@
 package proto
 
 import (
-	"github.com/cloudprober/cloudprober/rds/client/proto"
-	proto_1 "github.com/cloudprober/cloudprober/rds/proto"
+	"github.com/cloudprober/cloudprober/internal/rds/client/proto"
+	proto_1 "github.com/cloudprober/cloudprober/internal/rds/proto"
 	proto_5 "github.com/cloudprober/cloudprober/targets/gce/proto"
 	proto_A "github.com/cloudprober/cloudprober/targets/file/proto"
 	proto_8 "github.com/cloudprober/cloudprober/targets/http/proto"
@@ -73,6 +73,29 @@ import (
 	// when (and if) we move to the watch API. Default is 30s.
 	reEvalSec?:        int32                            @protobuf(19,int32,name=re_eval_sec)
 	rdsServerOptions?: proto.#ClientConf.#ServerOptions @protobuf(20,rds.ClientConf.ServerOptions,name=rds_server_options)
+}
+
+#Endpoint: {
+	// Endpoint name. Metrics for a target are identified by a combination of
+	// endpoint name and port name, if specified.
+	name?: string @protobuf(1,string)
+
+	// Optional IP address. If not specified, endpoint name is DNS resolved.
+	ip?: string @protobuf(2,string)
+
+	// Endpoint port. If specified, this port will be used by the port-based
+	// probes (e.g.  TCP, HTTP), if probe's configuration doesn't specify a port.
+	port?: int32 @protobuf(3,int32)
+
+	// HTTP probe URL. If provided, this field is used by the HTTP probe, if
+	// probe configuration itself doesn't specify URL fields.
+	url?: string @protobuf(4,string)
+
+	// Endpoint labels. These labels can be exported as metrics labels using the
+	// `additional_label` field in the probe configuration.
+	labels?: {
+		[string]: string
+	} @protobuf(5,map[string]string)
 }
 
 #TargetsDef: {
@@ -146,6 +169,24 @@ import (
 		dummyTargets: #DummyTargets @protobuf(20,DummyTargets,name=dummy_targets)
 	}
 
+	// Static endpoints. These endpoints are merged with the resources returned
+	// by the targets type above.
+	// Example:
+	//   endpoint {
+	//     name: "service-gtwy-1"
+	//     ip: "10.1.18.121"
+	//     port: 8080
+	//     labels {
+	//       key: "service"
+	//       value: "products-service"
+	//     }
+	//   }
+	//   endpoint {
+	//     name: "frontend-url1"
+	//     url: "https://frontend.example.com/url1"
+	//   }
+	endpoint?: [...#Endpoint] @protobuf(23,Endpoint)
+
 	// Regex to apply on the targets.
 	regex?: string @protobuf(21,string)
 
@@ -153,6 +194,9 @@ import (
 	// configurator) service. This functionality works only if lame_duck_options
 	// are specified.
 	excludeLameducks?: bool @protobuf(22,bool,name=exclude_lameducks,default)
+
+	// Provide a dns resolver override instead of using the default dns resolver.
+	dnsServer?: string @protobuf(37,string,name=dns_server)
 }
 
 // DummyTargets represent empty targets, which are useful for external

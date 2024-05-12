@@ -30,14 +30,14 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cloudprober/cloudprober/common/message"
+	udpsrv "github.com/cloudprober/cloudprober/internal/servers/udp"
+	"github.com/cloudprober/cloudprober/internal/sysvars"
+	"github.com/cloudprober/cloudprober/internal/udpmessage"
 	"github.com/cloudprober/cloudprober/logger"
 	"github.com/cloudprober/cloudprober/metrics"
 	"github.com/cloudprober/cloudprober/probes/options"
 	"github.com/cloudprober/cloudprober/probes/probeutils"
 	configpb "github.com/cloudprober/cloudprober/probes/udp/proto"
-	udpsrv "github.com/cloudprober/cloudprober/servers/udp"
-	"github.com/cloudprober/cloudprober/sysvars"
 	"github.com/cloudprober/cloudprober/targets/endpoint"
 )
 
@@ -69,9 +69,9 @@ type Probe struct {
 	runID       uint64
 	ipVer       int
 
-	targets []endpoint.Endpoint   // List of targets for a probe iteration.
-	res     map[flow]*probeResult // Results by flow.
-	fsm     *message.FlowStateMap // Map flow parameters to flow state.
+	targets []endpoint.Endpoint      // List of targets for a probe iteration.
+	res     map[flow]*probeResult    // Results by flow.
+	fsm     *udpmessage.FlowStateMap // Map flow parameters to flow state.
 	payload []byte
 
 	// Intermediate buffers of sent and received packets
@@ -86,7 +86,8 @@ type Probe struct {
 // That's the reason we use metrics.Int types instead of metrics.AtomicInt.
 type probeResult struct {
 	total, success, delayed int64
-	latency                 metrics.Value
+	latency                 metrics.LatencyValue
+	target                  endpoint.Endpoint
 }
 
 // Metrics converts probeResult into metrics.EventMetrics object
@@ -104,10 +105,6 @@ func (prr probeResult) eventMetrics(probeName string, opts *options.Options, f f
 		AddLabel("probe", probeName).
 		AddLabel("dst", f.target)
 
-	for _, al := range opts.AdditionalLabels {
-		m.AddLabel(al.KeyValueForTarget(endpoint.Endpoint{Name: f.target}))
-	}
-
 	if c.GetExportMetricsByPort() {
 		m.AddLabel("src_port", f.srcPort).
 			AddLabel("dst_port", fmt.Sprintf("%d", c.GetPort()))
@@ -116,15 +113,16 @@ func (prr probeResult) eventMetrics(probeName string, opts *options.Options, f f
 	return m
 }
 
-func (p *Probe) newProbeResult() *probeResult {
-	var latVal metrics.Value
+func (p *Probe) newProbeResult(target endpoint.Endpoint) *probeResult {
+	var latVal metrics.LatencyValue
 	if p.opts.LatencyDist != nil {
-		latVal = p.opts.LatencyDist.Clone()
+		latVal = p.opts.LatencyDist.CloneDist()
 	} else {
 		latVal = metrics.NewFloat(0)
 	}
 	return &probeResult{
 		latency: latVal,
+		target:  target,
 	}
 }
 
@@ -141,7 +139,7 @@ func (p *Probe) Init(name string, opts *options.Options) error {
 	}
 	p.src = sysvars.Vars()["hostname"]
 	p.c = c
-	p.fsm = message.NewFlowStateMap()
+	p.fsm = udpmessage.NewFlowStateMap()
 	p.res = make(map[flow]*probeResult)
 
 	if p.c.GetPayloadSize() != 0 {
@@ -209,7 +207,7 @@ func (p *Probe) initProbeRunResults() error {
 		if !p.c.GetExportMetricsByPort() {
 			f := flow{"", target.Name}
 			if p.res[f] == nil {
-				p.res[f] = p.newProbeResult()
+				p.res[f] = p.newProbeResult(target)
 			}
 			continue
 		}
@@ -217,7 +215,7 @@ func (p *Probe) initProbeRunResults() error {
 		for _, srcPort := range p.srcPortList {
 			f := flow{srcPort, target.Name}
 			if p.res[f] == nil {
-				p.res[f] = p.newProbeResult()
+				p.res[f] = p.newProbeResult(target)
 			}
 		}
 	}
@@ -348,7 +346,7 @@ func (p *Probe) recvLoop(ctx context.Context, conn *net.UDPConn) {
 		}
 
 		rxTS := time.Now()
-		msg, err := message.NewMessage(b[:msgLen])
+		msg, err := udpmessage.NewMessage(b[:msgLen])
 		if err != nil {
 			p.l.Errorf("Incoming message error from %s: %v", raddr, err)
 			continue
@@ -392,7 +390,7 @@ func (p *Probe) runSingleProbe(f flow, conn *net.UDPConn, maxLen int, raddr *net
 // capture the responses before "timeout" and the main loop will flush the
 // results.
 func (p *Probe) runProbe() {
-	if len(p.targets) == 0 {
+	if !p.opts.IsScheduled() || len(p.targets) == 0 {
 		return
 	}
 	maxLen := int(p.c.GetMaxLength())
@@ -425,7 +423,7 @@ func (p *Probe) runProbe() {
 		}
 
 		for _, al := range p.opts.AdditionalLabels {
-			al.UpdateForTarget(endpoint.Endpoint{Name: target.Name}, ip.String(), dstPort)
+			al.UpdateForTarget(target, ip.String(), dstPort)
 		}
 
 		for i := 0; i < packetsPerTarget; i++ {
@@ -489,9 +487,7 @@ func (p *Probe) Start(ctx context.Context, dataChan chan *metrics.EventMetrics) 
 		case <-statsExportTicker.C:
 			for f, result := range p.res {
 				em := result.eventMetrics(p.name, p.opts, f, p.c)
-				em.LatencyUnit = p.opts.LatencyUnit
-				p.opts.LogMetrics(em)
-				dataChan <- em
+				p.opts.RecordMetrics(result.target, em, dataChan)
 			}
 			// Use this opportunity to refresh targets as well.
 			p.updateTargets()

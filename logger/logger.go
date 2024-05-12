@@ -1,4 +1,4 @@
-// Copyright 2017-2020 The Cloudprober Authors.
+// Copyright 2017-2023 The Cloudprober Authors.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,11 +17,16 @@
 package logger
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,17 +35,22 @@ import (
 	"cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/logging"
 	md "github.com/cloudprober/cloudprober/common/metadata"
-	"github.com/golang/glog"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/option"
 )
 
 var (
+	logFmt = flag.String("logfmt", "text", "Log format. Valid values: text, json")
+	_      = flag.Bool("logtostderr", true, "(deprecated) this option doesn't do anything anymore. All logs to stderr by default.")
+
 	debugLog     = flag.Bool("debug_log", false, "Whether to output debug logs or not")
 	debugLogList = flag.String("debug_logname_regex", "", "Enable debug logs for only for log names that match this regex (e.g. --debug_logname_regex=.*probe1.*")
 
 	// Enable/Disable cloud logging
 	disableCloudLogging = flag.Bool("disable_cloud_logging", false, "Disable cloud logging.")
+
+	// Override the GCP cloud logging endpoint.
+	gcpLoggingEndpoint = flag.String("gcp_logging_endpoint", "", "GCP logging endpoint")
 
 	// LogPrefixEnvVar environment variable is used to determine the stackdriver
 	// log name prefix. Default prefix is "cloudprober".
@@ -50,15 +60,18 @@ var (
 // EnvVars defines environment variables that can be used to modify the logging
 // behavior.
 var EnvVars = struct {
-	DisableCloudLogging, DebugLog string
+	DisableCloudLogging, DebugLog, GCPLoggingEndpoint string
 }{
 	"CLOUDPROBER_DISABLE_CLOUD_LOGGING",
 	"CLOUDPROBER_DEBUG_LOG",
+	"CLOUDPROBER_GCP_LOGGING_ENDPOINT",
 }
 
 const (
-	// Prefix for the cloudprober stackdriver log names.
-	cloudproberPrefix = "cloudprober"
+	// Default "system" label and stackdriver log name prefix.
+	defaultSystemName = "cloudprober"
+
+	criticalLevel = slog.Level(12)
 )
 
 const (
@@ -66,19 +79,49 @@ const (
 	//	Ref: https://cloud.google.com/logging/docs/api/ref_v2beta1/rest/v2beta1/LogEntry
 	disapprovedRegExp = "[^A-Za-z0-9_/.-]"
 
-	// MaxLogEntrySize Max size of each log entry (100 KB)
-	// This limit helps avoid creating very large log lines in case someone
-	// accidentally creates a large EventMetric, which in turn is possible due to
-	// unbounded nature of "map" metric where keys are created on demand.
-	//
-	// TODO(manugarg): We can possibly get rid of this check now as the code that
-	// could cause a large map metric has been fixed now. Earlier, cloudprober's
-	// HTTP server used to respond to all URLs and used to record access to those
-	// URLs as a "map" metric. Now, it responds only to pre-configured URLs.
+	// MaxLogEntrySize Max size of each log entry (100 KB). We truncate logs if
+	// they are bigger than this size.
 	MaxLogEntrySize = 102400
 )
 
-func enableDebugLog(debugLog bool, debugLogRe string, logName string) bool {
+// basePath is the root location of the cloudprober source code at the build
+// time, e.g. /Users/manugarg/code/cloudprober. We trim this path from the
+// logged source file names. We set this in the init() function.
+var basePath string
+
+// We trim this path from the logged source function name.
+const basePackage = "github.com/cloudprober/cloudprober/"
+
+var defaultWritter = io.Writer(os.Stderr)
+
+func replaceAttrs(_ []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.SourceKey {
+		source := a.Value.Any().(*slog.Source)
+		source.File = strings.TrimPrefix(source.File, basePath)
+		source.Function = strings.TrimPrefix(source.Function, basePackage)
+	}
+	return a
+}
+
+func slogHandler(w io.Writer) slog.Handler {
+	if w == nil {
+		w = defaultWritter
+	}
+	opts := &slog.HandlerOptions{
+		AddSource:   true,
+		ReplaceAttr: replaceAttrs,
+	}
+
+	switch *logFmt {
+	case "json":
+		return slog.NewJSONHandler(w, opts)
+	case "text":
+		return slog.NewTextHandler(w, opts)
+	}
+	panic("invalid log format: " + *logFmt)
+}
+
+func enableDebugLog(debugLog bool, debugLogRe string, attrs ...slog.Attr) bool {
 	if !debugLog && debugLogRe == "" {
 		return false
 	}
@@ -93,8 +136,10 @@ func enableDebugLog(debugLog bool, debugLogRe string, logName string) bool {
 		panic(fmt.Sprintf("error while parsing log name regex (%s): %v", debugLogRe, err))
 	}
 
-	if r.MatchString(logName) {
-		return true
+	for _, attr := range attrs {
+		if r.MatchString(attr.Key + "=" + attr.Value.String()) {
+			return true
+		}
 	}
 
 	return false
@@ -118,106 +163,147 @@ func enableDebugLog(debugLog bool, debugLogRe string, logName string) bool {
 // metadata about the log entries can be inserted into this map.
 // For example probe id can be inserted into this map.
 type Logger struct {
-	name                string
-	logc                *logging.Client
-	logger              *logging.Logger
+	shandler            slog.Handler
+	gcpLogc             *logging.Client
+	gcpLogger           *logging.Logger
 	debugLog            bool
 	disableCloudLogging bool
-	labels              map[string]string
-	// TODO(manugarg): Logger should eventually embed the probe id and each probe
-	// should get a different Logger object (embedding that probe's probe id) but
-	// sharing the same logging client. We could then make probe id one of the
-	// metadata on all logging messages.
+	gcpLoggingEndpoint  string
+	attrs               []slog.Attr
+	systemAttr          string
+	writer              io.Writer
 }
 
 // Option can be used for adding additional metadata information in logger.
 type Option func(*Logger)
 
-// NewCloudproberLog is a convenient wrapper around New that sets context to
-// context.Background and attaches cloudprober prefix to log names.
-func NewCloudproberLog(component string) (*Logger, error) {
-	cpPrefix := cloudproberPrefix
-
-	envLogPrefix := os.Getenv(LogPrefixEnvVar)
-	if envLogPrefix != "" {
-		cpPrefix = envLogPrefix
-	}
-
-	return New(context.Background(), cpPrefix+"."+component)
+// NewWithAttrs is a shortcut to create a new logger with a set of attributes.
+func NewWithAttrs(attrs ...slog.Attr) *Logger {
+	return New(WithAttr(attrs...))
 }
 
-// New returns a new Logger object with cloud logging client initialized if running on GCE.
-func New(ctx context.Context, logName string, opts ...Option) (*Logger, error) {
+// New returns a new cloudprober Logger.
+func New(opts ...Option) *Logger {
+	return newLogger(opts...)
+}
+
+// NewLegacy returns a new cloudprober Logger.
+// Deprecated: Use New or NewWithAttrs instead.
+func NewLegacy(ctx context.Context, logName string, opts ...Option) (*Logger, error) {
+	return newLogger(append(opts, WithAttr(slog.String("name", logName)))...), nil
+}
+
+func newLogger(opts ...Option) *Logger {
 	l := &Logger{
-		name:                logName,
-		labels:              make(map[string]string),
-		debugLog:            enableDebugLog(*debugLog, *debugLogList, logName),
 		disableCloudLogging: *disableCloudLogging,
+		gcpLoggingEndpoint:  *gcpLoggingEndpoint,
+		systemAttr:          defaultSystemName,
 	}
 	for _, opt := range opts {
 		opt(l)
 	}
 
-	if !metadata.OnGCE() || l.disableCloudLogging {
-		return l, nil
-	}
-	l.Infof("Running on GCE. Logs for %s will go to Cloud (Stackdriver).", l.name)
+	l.attrs = append([]slog.Attr{slog.String("system", l.systemAttr)}, l.attrs...)
 
-	if err := l.EnableStackdriverLogging(ctx); err != nil {
-		return nil, err
+	// Initialize the traditional logger.
+	l.shandler = slogHandler(l.writer).WithAttrs(l.attrs)
+
+	l.debugLog = enableDebugLog(*debugLog, *debugLogList, l.attrs...)
+
+	if metadata.OnGCE() && !l.disableCloudLogging {
+		l.EnableStackdriverLogging()
 	}
-	return l, nil
+	return l
 }
 
-// WithLabels option can be used to add a set of labels to all logs, e.g.
-// logger.New(ctx, logName, logger.WithLabels(myLabels))
-func WithLabels(labels map[string]string) Option {
+// WithAttr option can be used to add a set of labels to all logs, e.g.
+// logger.New(ctx, logName, logger.WithAttr(myLabels))
+func WithAttr(attrs ...slog.Attr) Option {
 	return func(l *Logger) {
-		if l.labels == nil {
-			l.labels = make(map[string]string)
-		}
-		for k, v := range labels {
-			l.labels[k] = v
+		for _, attr := range attrs {
+			if attr.Key == "system" {
+				l.systemAttr = attr.Value.String()
+				continue
+			}
+			l.attrs = append(l.attrs, attr)
 		}
 	}
+}
+
+func WithWriter(w io.Writer) Option {
+	return func(l *Logger) {
+		l.writer = w
+	}
+}
+
+func verifySDLogName(logName string) (string, error) {
+	// Check for illegal characters in the log name
+	if match, err := regexp.Match(disapprovedRegExp, []byte(logName)); err != nil || match {
+		if err != nil {
+			return "", fmt.Errorf("unable to parse logName (%s): %v", logName, err)
+		}
+		return "", fmt.Errorf("logName (%s) contains an invalid character, valid characters are [A-Za-z0-9_/.-]", logName)
+	}
+
+	// Any forward slashes need to be URL encoded, so we query escape to replace them
+	return url.QueryEscape(logName), nil
+}
+
+func (l *Logger) sdLogName() (string, error) {
+	prefix := l.systemAttr
+	envLogPrefix := os.Getenv(LogPrefixEnvVar)
+	if os.Getenv(LogPrefixEnvVar) != "" {
+		prefix = envLogPrefix
+	}
+
+	for _, attr := range l.attrs {
+		if attr.Key == "name" {
+			return verifySDLogName(attr.Value.String())
+		}
+
+		if slices.Contains([]string{"component", "probe", "surfacer"}, attr.Key) {
+			return verifySDLogName(prefix + "." + attr.Value.String())
+		}
+	}
+
+	return verifySDLogName(prefix)
 }
 
 // EnableStackdriverLogging enables logging to stackdriver.
-func (l *Logger) EnableStackdriverLogging(ctx context.Context) error {
-	if !metadata.OnGCE() {
-		return fmt.Errorf("not running on GCE")
+func (l *Logger) EnableStackdriverLogging() {
+	logName, err := l.sdLogName()
+	if err != nil {
+		l.Warningf("Error getting log name for google cloud logging: %v, will skip", err)
+		return
 	}
 
 	projectID, err := metadata.ProjectID()
 	if err != nil {
-		return err
+		l.Warningf("Error getting project id for google cloud logging: %v, will skip", err)
+		return
 	}
 
-	if l.name == "" {
-		return fmt.Errorf("logName cannot be empty")
+	// Create Client options for logging client
+	o := []option.ClientOption{option.WithTokenSource(google.ComputeTokenSource(""))}
+	if l.gcpLoggingEndpoint != "" {
+		l.Infof("Setting logging endpoint to %s", l.gcpLoggingEndpoint)
+		o = append(o, option.WithEndpoint(l.gcpLoggingEndpoint))
 	}
-	// Check for illegal characters in the log name
-	if match, err := regexp.Match(disapprovedRegExp, []byte(l.name)); err != nil || match {
-		if err != nil {
-			return fmt.Errorf("unable to parse logName: %v", err)
-		}
-		return fmt.Errorf("logName of %s contains an invalid character, valid characters are [A-Za-z0-9_/.-]", l.name)
-	}
-	// Any forward slashes need to be URL encoded, so we query escape to replace them
-	logName := url.QueryEscape(l.name)
 
-	l.logc, err = logging.NewClient(ctx, projectID, option.WithTokenSource(google.ComputeTokenSource("")))
+	l.gcpLogc, err = logging.NewClient(context.Background(), projectID, o...)
 	if err != nil {
-		return err
+		l.Warningf("Error creating client for google cloud logging: %v, will skip", err)
+		return
 	}
 
+	commonLabels := make(map[string]string)
 	// Add instance_name to common labels if available.
 	if !md.IsKubernetes() && !md.IsCloudRunJob() && !md.IsCloudRunService() {
 		instanceName, err := metadata.InstanceName()
 		if err != nil {
 			l.Infof("Error getting instance name on GCE: %v", err)
 		} else {
-			l.labels["instance_name"] = instanceName
+			commonLabels["instance_name"] = instanceName
 		}
 	}
 
@@ -231,149 +317,157 @@ func (l *Logger) EnableStackdriverLogging(ctx context.Context) error {
 		// above), rather than time.
 		logging.DelayThreshold(10 * time.Second),
 		// Common labels that will be present in all log entries.
-		logging.CommonLabels(l.labels),
+		logging.CommonLabels(commonLabels),
 	}
 
-	l.logger = l.logc.Logger(logName, loggerOpts...)
-	return nil
+	l.gcpLogger = l.gcpLogc.Logger(logName, loggerOpts...)
 }
 
-func payloadToString(payload ...string) string {
-	if len(payload) == 1 {
-		return payload[0]
-	}
+func (l *Logger) gcpLogEntry(r *slog.Record) logging.Entry {
+	// Let's print the log message.
+	var buf bytes.Buffer
+	slogHandler(&buf).Handle(context.Background(), *r)
 
-	var b strings.Builder
-	for _, s := range payload {
-		b.WriteString(s)
+	return logging.Entry{
+		Severity: map[slog.Level]logging.Severity{
+			slog.LevelDebug: logging.Debug,
+			slog.LevelInfo:  logging.Info,
+			slog.LevelWarn:  logging.Warning,
+			slog.LevelError: logging.Error,
+			criticalLevel:   logging.Critical,
+		}[r.Level],
+		Payload: buf.String(),
 	}
-	return b.String()
 }
 
-// log sends payload ([]string) to cloud logging. If cloud logging client is
-// not initialized (e.g. if not running on GCE) or cloud logging fails for some
-// reason, it writes logs through the traditional logger.
-func (l *Logger) log(severity logging.Severity, payload ...string) {
-	payloadStr := payloadToString(payload...)
+// logAttrs logs the message to stderr with the given attributes. If
+// running on GCE, logs are also sent to GCE or cloud logging.
+func (l *Logger) logAttrs(level slog.Level, depth int, msg string, attrs ...slog.Attr) {
+	depth++
 
-	if len(payloadStr) > MaxLogEntrySize {
+	if len(msg) > MaxLogEntrySize {
 		truncateMsg := "... (truncated)"
 		truncateMsgLen := len(truncateMsg)
-		payloadStr = payloadStr[:MaxLogEntrySize-truncateMsgLen] + truncateMsg
+		msg = msg[:MaxLogEntrySize-truncateMsgLen] + truncateMsg
 	}
 
-	if l == nil {
-		genericLog(severity, "nil", payloadStr)
-		return
+	var pcs [1]uintptr
+	runtime.Callers(depth, pcs[:])
+	r := slog.NewRecord(time.Now(), level, msg, pcs[0])
+	r.AddAttrs(attrs...)
+
+	if l != nil && l.shandler != nil {
+		l.shandler.Handle(context.Background(), r)
+	} else {
+		slogHandler(nil).Handle(context.Background(), r)
 	}
 
-	if l.logger == nil {
-		genericLog(severity, l.name, payloadStr)
-		return
+	if l != nil && l.gcpLogger != nil {
+		l.gcpLogger.Log(l.gcpLogEntry(&r))
 	}
 
-	l.logger.Log(logging.Entry{
-		Severity: severity,
-		Payload:  payloadStr,
-	})
+	if level == criticalLevel {
+		if l != nil && l.gcpLogc != nil {
+			l.gcpLogc.Close()
+		}
+		os.Exit(1)
+	}
 }
 
-// Close closes the cloud logging client if it exists. This flushes the buffer
-// and should be called before exiting the program to ensure all logs are persisted.
-func (l *Logger) Close() error {
-	if l != nil && l.logc != nil {
-		return l.logc.Close()
+func (l *Logger) logDebug() bool {
+	if l != nil {
+		return l.debugLog
 	}
-
-	return nil
+	return enableDebugLog(*debugLog, *debugLogList)
 }
 
 // Debug logs messages with logging level set to "Debug".
 func (l *Logger) Debug(payload ...string) {
-	if l.debugLog {
-		l.log(logging.Debug, payload...)
+	if l.logDebug() {
+		l.logAttrs(slog.LevelDebug, 2, strings.Join(payload, ""))
+	}
+}
+
+// Debug logs messages with logging level set to "Debug".
+func (l *Logger) DebugAttrs(msg string, attrs ...slog.Attr) {
+	if l.logDebug() {
+		l.logAttrs(slog.LevelDebug, 2, msg, attrs...)
 	}
 }
 
 // Info logs messages with logging level set to "Info".
 func (l *Logger) Info(payload ...string) {
-	l.log(logging.Info, payload...)
+	l.logAttrs(slog.LevelInfo, 2, strings.Join(payload, ""))
+}
+
+// InfoWithAttrs logs messages with logging level set to "Info".
+func (l *Logger) InfoAttrs(msg string, attrs ...slog.Attr) {
+	l.logAttrs(slog.LevelInfo, 2, msg, attrs...)
 }
 
 // Warning logs messages with logging level set to "Warning".
 func (l *Logger) Warning(payload ...string) {
-	l.log(logging.Warning, payload...)
+	l.logAttrs(slog.LevelWarn, 2, strings.Join(payload, ""))
+}
+
+// WarningAttrs logs messages with logging level set to "Warning".
+func (l *Logger) WarningAttrs(msg string, attrs ...slog.Attr) {
+	l.logAttrs(slog.LevelWarn, 2, msg, attrs...)
 }
 
 // Error logs messages with logging level set to "Error".
 func (l *Logger) Error(payload ...string) {
-	l.log(logging.Error, payload...)
+	l.logAttrs(slog.LevelError, 2, strings.Join(payload, ""))
+}
+
+// ErrorAttrs logs messages with logging level set to "Warning".
+func (l *Logger) ErrorAttrs(msg string, attrs ...slog.Attr) {
+	l.logAttrs(slog.LevelError, 2, msg, attrs...)
 }
 
 // Critical logs messages with logging level set to "Critical" and
 // exits the process with error status. The buffer is flushed before exiting.
 func (l *Logger) Critical(payload ...string) {
-	l.log(logging.Critical, payload...)
-	if err := l.Close(); err != nil {
-		panic(fmt.Sprintf("could not close client: %v", err))
-	}
-	os.Exit(1)
+	l.logAttrs(criticalLevel, 2, strings.Join(payload, ""))
+}
+
+// Critical logs messages with logging level set to "Critical" and
+// exits the process with error status. The buffer is flushed before exiting.
+func (l *Logger) CriticalAttrs(msg string, attrs ...slog.Attr) {
+	l.logAttrs(criticalLevel, 2, msg, attrs...)
 }
 
 // Debugf logs formatted text messages with logging level "Debug".
 func (l *Logger) Debugf(format string, args ...interface{}) {
-	if l != nil && l.debugLog {
-		l.log(logging.Debug, fmt.Sprintf(format, args...))
+	if l.logDebug() {
+		l.logAttrs(slog.LevelDebug, 2, fmt.Sprintf(format, args...))
 	}
 }
 
 // Infof logs formatted text messages with logging level "Info".
 func (l *Logger) Infof(format string, args ...interface{}) {
-	l.log(logging.Info, fmt.Sprintf(format, args...))
+	l.logAttrs(slog.LevelInfo, 2, fmt.Sprintf(format, args...))
 }
 
 // Warningf logs formatted text messages with logging level "Warning".
 func (l *Logger) Warningf(format string, args ...interface{}) {
-	l.log(logging.Warning, fmt.Sprintf(format, args...))
+	l.logAttrs(slog.LevelWarn, 2, fmt.Sprintf(format, args...))
 }
 
 // Errorf logs formatted text messages with logging level "Error".
 func (l *Logger) Errorf(format string, args ...interface{}) {
-	l.log(logging.Error, fmt.Sprintf(format, args...))
+	l.logAttrs(slog.LevelError, 2, fmt.Sprintf(format, args...))
 }
 
 // Criticalf logs formatted text messages with logging level "Critical" and
 // exits the process with error status. The buffer is flushed before exiting.
 func (l *Logger) Criticalf(format string, args ...interface{}) {
-	l.log(logging.Critical, fmt.Sprintf(format, args...))
-	if err := l.Close(); err != nil {
-		panic(fmt.Sprintf("could not close client: %v", err))
-	}
-	os.Exit(1)
-}
-
-func genericLog(severity logging.Severity, name string, s string) {
-	// Set the caller frame depth to 3 so that can get to the actual caller of
-	// the logger. genericLog -> log -> Info* -> actualCaller
-	depth := 3
-
-	s = fmt.Sprintf("[%s] %s", name, s)
-
-	switch severity {
-	case logging.Debug, logging.Info:
-		glog.InfoDepth(depth, s)
-	case logging.Warning:
-		glog.WarningDepth(depth, s)
-	case logging.Error:
-		glog.ErrorDepth(depth, s)
-	case logging.Critical:
-		glog.FatalDepth(depth, s)
-	}
+	l.logAttrs(criticalLevel, 2, fmt.Sprintf(format, args...))
 }
 
 func envVarSet(key string) bool {
 	v, ok := os.LookupEnv(key)
-	if ok && strings.ToUpper(v) != "NO" && strings.ToUpper(v) != "FALSE" {
+	if ok && strings.ToUpper(v) != "NO" && strings.ToUpper(v) != "FALSE" && v != "" {
 		return true
 	}
 	return false
@@ -387,4 +481,14 @@ func init() {
 	if envVarSet(EnvVars.DebugLog) {
 		*debugLog = true
 	}
+
+	if envVarSet(EnvVars.GCPLoggingEndpoint) {
+		*gcpLoggingEndpoint = os.Getenv(EnvVars.GCPLoggingEndpoint)
+	}
+
+	// Determine the base path for the cloudprober source code.
+	var pcs [1]uintptr
+	runtime.Callers(1, pcs[:])
+	frame, _ := runtime.CallersFrames(pcs[:]).Next()
+	basePath = strings.TrimSuffix(frame.File, "logger/logger.go")
 }
